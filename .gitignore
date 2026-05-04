@@ -1,0 +1,27 @@
+# runtime data folders
+sms/
+sms_del/
+log/
+usage_total/
+usage_clients/
+temp/
+
+# user config + state (contains modem password, FTP creds, per-SMS state)
+smsFetcher.conf
+smsFetcher.state.json
+relay_state.json
+usage_state.json
+blacklist.json
+
+# python / pyinstaller build artifacts
+__pycache__/
+build/
+smsFetcher.exe
+
+# claude code per-machine settings (the .local suffix means "don't share")
+.claude/
+
+# ad-hoc local backup files (e.g. usage_state.json.bak.20260504-172709)
+*.bak
+*.bak.*
+.git.backup/
