@@ -180,7 +180,12 @@ gives full control over click behavior and styling.
   "telina_username": "xxxx",
   "telina_password": "xxxx",
   "telina_notif_number": "09111111111",
-  "telina_state_file": "temp/last-calls.json"
+  "telina_state_file": "temp/last-calls.json",
+  "forward_enabled": false,
+  "forward_match_sender": "",
+  "forward_match_substring": "",
+  "forward_replacements": {},
+  "forward_regex_replacements": []
 }
 ```
 
@@ -378,6 +383,112 @@ Stale `relay_state.json` entries get pruned in the same pass.
   if the sender was added to the blacklist later the Relayer's
   per-tick scan skips already-saved files from that sender (and the
   Notifier silently moves them on its next tick).
+
+## Match-based SMS forward
+
+Some senders are interesting enough that you want the **whole body**
+delivered to a second phone the moment it lands — not the URL-only
+relay (which only fires after you ignore a popup), but a literal
+`send_sms` of the SMS content. Example use case: bank transaction
+notifications where you want the amount + balance line on a backup
+phone right away.
+
+When `forward_enabled` is `true`, the Fetcher checks each newly-saved
+SMS against two filters:
+
+- `forward_match_sender` — the sender id must match exactly (e.g.
+  `"B.Pasargad"`). Empty string disables the feature even if
+  `forward_enabled` is true.
+- `forward_match_substring` — the body must contain this substring.
+  Empty string means "any body from that sender".
+
+If both filters pass, the Fetcher calls `modem.send_sms` to the
+`telina_notif_number` already configured for the call notifier
+(country code from `relay_sms_country_code`, leading `0` stripped from
+the local number — same conversion as the Telina watcher).
+
+Before the body is sent it's run through two rewrite stages, in this
+order — the match check above runs against the **original** body; the
+rewritten body is what actually goes out on the wire:
+
+1. `forward_replacements` — JSON object mapping source string →
+   replacement string, applied in insertion order via plain
+   `str.replace`. Use for fixed substrings: transliterations
+   (`"مانده": "MA"`) and known-literal headers
+   (`"1303.8000.13360737.1\n": ""`).
+2. `forward_regex_replacements` — JSON array of `[pattern, repl]`
+   pairs, applied in order via Python `re.sub`. Use for variable
+   content like dates, amounts, and account ids — anything that
+   changes per SMS so plain string-replace can't catch it. Invalid
+   patterns are logged and skipped (the rest of the chain still
+   runs). Example: `["\\n\\d\\d/\\d\\d_\\d\\d:\\d\\d", ""]` strips a
+   `\n02/16_16:20`-style timestamp line.
+
+Together these let you boil a verbose Persian bank notification down
+to a short ASCII summary that fits in one SMS — both dodging the
+UCS-2 silent-drop on Persian content **and** the firmware's ~30-char
+budget (see caveat below).
+
+### Where it fires
+
+The forward runs inside the Fetcher loop right after the "saved SMS …"
+log line, before the modem-side delete. Ordering consequences:
+
+- Blacklisted senders never reach this branch — those SMS are routed
+  straight to `sms_del/` at receive time and the forward check is
+  skipped.
+- If save+forward both succeed but the SIM-side delete fails, the
+  index goes into `pending_delete` (state file) and the next cycle
+  retries the **delete only** — no re-save, no re-forward. So the
+  forward is one-shot per SMS in the normal path.
+- If the process is killed between save and delete, the modem still
+  holds the record. On restart the Fetcher will re-save it (with a
+  `-02` suffix) and re-forward — same edge case the existing
+  save-then-delete sequence already accepts.
+
+There is **no retry** if `send_sms` itself raises. The error is logged
+(`forward: send_sms failed …`) and the cycle continues. The Fetcher
+shares the modem session with the Relayer / UsageTracker / Telina
+watcher; since send_sms is one POST, transient session-expiry is
+handled by the same re-login logic the rest of the modem path uses.
+
+### Caveat — silent send-limit
+
+Two thresholds matter and both are silent (HTTP 200, no error, no
+outbox entry, the SMSC never sees the message):
+
+- **UCS-2 (Persian / non-ASCII)**: ~17 characters (see [Sending SMS —
+  known firmware limit](#sending-sms--known-firmware-limit)). One
+  Persian word in the body forces the whole send to UCS-2.
+- **ASCII (GSM-7)**: ~30 characters. A 66-char ASCII send was
+  observed to silently drop on this firmware in real-world testing,
+  while a 28-char one went through. The README's earlier "ASCII URLs
+  of ~30 chars go through reliably" line was a *floor*, not a
+  *ceiling* — there is in fact a ceiling around the same number.
+
+The success log line records `ascii=True/False` and the byte length so
+both regimes are visible after the fact. A follow-up warning fires
+when the resulting body still has non-ASCII and is over 17 chars; for
+ASCII bodies, just keep them well under 30 chars and you're safe.
+
+The two rewrite stages above (`forward_replacements` +
+`forward_regex_replacements`) are the intended workaround: list the
+fixed substrings to transliterate or strip, then add regex rules for
+the variable parts (dates, ids), and trim the body to the bare
+minimum. For Bank Pasargad's transaction notification the stripped
+form ends up around 28 chars and fits in one SMS:
+
+```
++400,000,000
+MA: 640,974,696
+```
+
+For bodies that are mostly Persian (long free-form messages where
+transliteration isn't practical), the relay path
+([SMS relay (when you're away)](#sms-relay-when-youre-away)) is the
+right tool — it uploads the body as an HTML page and SMSes only the
+short URL, which fits inside the ASCII send budget regardless of body
+content.
 
 ## LTE usage tracking
 
@@ -691,11 +802,25 @@ but no further deletes take effect. `ModemClient.delete_sms` therefore uses
 The send endpoint is the same `formSmsManage` with `action_id=sendMsg`,
 `submit-url=/sms_new.htm`, and fields `countryCode`, `sendMsgNumber`,
 `sendMsgContent`. The DWR-M960 v1.01.07 firmware silently drops sends
-longer than roughly **17 UCS-2 characters** — HTTP returns 200, no
-error indication, the message never reaches the SMSC and never appears
-in the panel's outbox. **ASCII-only** sends of ~30 chars (URLs) go
-through reliably, however, which is why the relay path forwards a
-short URL rather than the SMS body itself.
+above two thresholds — both quiet (HTTP 200, no error, no outbox
+entry, the SMSC never sees the message):
+
+- **UCS-2 (any non-ASCII byte)**: ~17 characters. One Persian word in
+  the body forces the whole send to UCS-2 and applies this stricter
+  cap to the entire string.
+- **ASCII / GSM-7**: ~30 characters. Confirmed empirically on
+  2026-05-06 — a 66-char ASCII send returned HTTP 200 with valid
+  session and zero outbox entries afterwards (silent drop), while a
+  28-char ASCII send to the same recipient queued in outbox at
+  `index=5` and was delivered.
+
+The relay path uses ~30-char URLs precisely because they fit under
+the second threshold. The match-based forward path
+([Match-based SMS forward](#match-based-sms-forward)) trims bodies via
+`forward_replacements` + `forward_regex_replacements` so the rewritten
+text lands well under 30 chars before going out. If a feature needs
+to send more than that, route the content through the FTP-upload +
+URL-only relay instead of the direct send.
 
 ### Outbox listing & delete
 
@@ -826,7 +951,11 @@ The log writer rolls over at midnight (next entry opens
 ## Threads
 
 - **Fetcher** — polls the modem every `poll_interval_seconds` (500 s default),
-  saves new SMS to `sms/`, deletes from SIM after fsync.
+  saves new SMS to `sms/`, deletes from SIM after fsync. If
+  `forward_enabled` and the new message matches
+  `forward_match_sender` + `forward_match_substring`, also fires a
+  one-shot `send_sms` of the body to `telina_notif_number` (see
+  [Match-based SMS forward](#match-based-sms-forward)).
 - **Notifier** — every `notification_interval_seconds` (60 s default), checks
   DND state and (if OK) pops the oldest JSON from `sms/` into a Tk
   popup window, then moves it to `sms_del/`.

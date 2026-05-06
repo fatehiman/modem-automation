@@ -91,6 +91,11 @@ DEFAULT_CONFIG = {
     "telina_password": "xxxx",
     "telina_notif_number": "09111111111",
     "telina_state_file": "temp/last-calls.json",
+    "forward_enabled": False,
+    "forward_match_sender": "",
+    "forward_match_substring": "",
+    "forward_replacements": {},
+    "forward_regex_replacements": [],
 }
 
 
@@ -390,11 +395,13 @@ class ModemClient:
             )
 
     def send_sms(self, country_code: str, number: str, content: str):
-        """Send an outbound SMS via /sms_new.htm's form. The panel JS caps
-        the body at 765 chars; longer than that is silently rejected.
-        ASCII bodies of ~30 chars (URLs) go through reliably on this
-        firmware — UCS-2/Persian sends are the ones that get silently
-        dropped above ~17 chars, so this is only safe for ASCII."""
+        """Send an outbound SMS via /sms_new.htm's form. Two firmware
+        thresholds are silent (HTTP 200, no exception, no outbox entry):
+        UCS-2/Persian sends drop above ~17 chars, and ASCII/GSM-7 sends
+        drop above ~30 chars — confirmed empirically with a 66-char
+        ASCII body that vanished while a 28-char one queued. Stay well
+        under 30 chars for direct sends; use the relay path for
+        anything larger."""
         url = f"{self.base}/boafrm/formSmsManage"
         r = self.session.post(
             url,
@@ -650,6 +657,97 @@ class Fetcher:
             self._wake.clear()
             self._wake.wait(self.cfg["poll_interval_seconds"])
 
+    def _maybe_forward(self, rec: dict, json_path: Path):
+        """If `forward_enabled` and the message matches both
+        `forward_match_sender` (exact) and `forward_match_substring`
+        (substring; "" means any), rewrite the body via
+        `forward_replacements` (literal) and `forward_regex_replacements`
+        (re.sub), then send it to `telina_notif_number` via the modem.
+        Best-effort: a single attempt, no retry — failures log and move
+        on. Silently suppressed for blocklisted senders (caller already
+        routed those away from this branch).
+
+        Note: the modem's send path silently drops UCS-2/Persian sends
+        above ~17 chars and ASCII/GSM-7 sends above ~30 chars (see
+        "Sending SMS — known firmware limit"). The rewrite chain
+        exists to bring matched bodies under both ceilings; the success
+        log records `len` and `ascii=` so over-budget sends are at
+        least visible after the fact."""
+        if not self.cfg.get("forward_enabled", False):
+            return
+        match_sender = str(self.cfg.get("forward_match_sender", "")).strip()
+        if not match_sender:
+            return
+        sender = str(rec.get("sender", ""))
+        if sender != match_sender:
+            return
+        match_sub = str(self.cfg.get("forward_match_substring", ""))
+        body = str(rec.get("body", ""))
+        if match_sub and match_sub not in body:
+            return
+        local = str(self.cfg.get("telina_notif_number", "")).strip()
+        if not local:
+            self.logger.warning(
+                f"forward: trigger matched ({sender}) but "
+                f"telina_notif_number is empty; skipping"
+            )
+            return
+        cc = str(self.cfg.get("relay_sms_country_code", "98"))
+        if cc and local.startswith("0"):
+            local = local[1:]
+        # Apply config-defined rewrites so an otherwise-Persian or
+        # over-budget body becomes a short ASCII string that fits in a
+        # single SMS. Match was against the original body; we send the
+        # rewritten one.
+        # 1. `forward_replacements` — literal str.replace, applied in
+        #    insertion order. Use for transliterations and fixed
+        #    substrings.
+        # 2. `forward_regex_replacements` — list of [pattern, repl]
+        #    pairs, applied in order with re.sub. Use for variable
+        #    content like dates and ids.
+        replacements = self.cfg.get("forward_replacements") or {}
+        send_body = body
+        if isinstance(replacements, dict):
+            for src, dst in replacements.items():
+                if src:
+                    send_body = send_body.replace(str(src), str(dst))
+        regex_replacements = self.cfg.get("forward_regex_replacements") or []
+        if isinstance(regex_replacements, list):
+            for entry in regex_replacements:
+                if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                    continue
+                try:
+                    send_body = re.sub(
+                        str(entry[0]), str(entry[1]), send_body,
+                    )
+                except re.error as e:
+                    self.logger.error(
+                        f"forward: invalid regex {entry[0]!r}: {e}"
+                    )
+        is_ascii = send_body.isascii()
+        try:
+            self.modem.send_sms(
+                country_code=cc, number=local, content=send_body,
+            )
+            self.logger.info(
+                f"forward: sent body from sender={sender} "
+                f"to {self.cfg['telina_notif_number']} "
+                f"({len(send_body)} chars, ascii={is_ascii}, "
+                f"source={json_path.name})"
+            )
+            if not is_ascii and len(send_body) > 17:
+                self.logger.warning(
+                    f"forward: body still contains non-ASCII at "
+                    f"{len(send_body)} chars; DWR-M960 silently drops "
+                    f"UCS-2 sends > ~17 chars — destination may "
+                    f"receive nothing"
+                )
+        except Exception as e:
+            self.logger.error(
+                f"forward: send_sms failed for {json_path.name}: {e}",
+                exc_info=True,
+            )
+
     def cycle(self):
         records = self.modem.list_sms()
         self.logger.info(f"polled inbox: {len(records)} message(s) present")
@@ -688,6 +786,7 @@ class Fetcher:
                     f"saved SMS index={idx} sender={sender} "
                     f"received_at='{rec['received_at']}' -> {path.name}"
                 )
+                self._maybe_forward(rec, path)
             new_count += 1
             if not self.cfg.get("delete_after_save", True):
                 continue
