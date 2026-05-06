@@ -1688,6 +1688,32 @@ class UsageTracker:
                 "today flagged calc-status=average"
             )
 
+        # Cap sum of per-IP deltas at the global delta. The /usertraffic.htm
+        # per-IP counter on this firmware resets multiple times per hour
+        # without actually losing bytes (firmware glitch — see readme.md
+        # "Usage counters — known firmware quirks"). Without this cap,
+        # _delta_with_reset treats each spurious reset's post-reset value
+        # as fresh usage and per-IP totals balloon to physically-impossible
+        # numbers (e.g. 57 GB attributed to one client on a day where the
+        # global only saw 4 GB). The global lteTx/lteRx is the reliable
+        # upper bound — sum of per-IP attributions can't exceed it.
+        sum_tx = sum(v["tx"] for v in d_per_ip.values())
+        sum_rx = sum(v["rx"] for v in d_per_ip.values())
+        if sum_tx > d_lte_tx:
+            factor = (d_lte_tx / sum_tx) if sum_tx else 0
+            for v in d_per_ip.values():
+                v["tx"] = int(v["tx"] * factor)
+            self.logger.info(
+                f"usage: capped per-IP tx sum {sum_tx} -> {d_lte_tx} bytes"
+            )
+        if sum_rx > d_lte_rx:
+            factor = (d_lte_rx / sum_rx) if sum_rx else 0
+            for v in d_per_ip.values():
+                v["rx"] = int(v["rx"] * factor)
+            self.logger.info(
+                f"usage: capped per-IP rx sum {sum_rx} -> {d_lte_rx} bytes"
+            )
+
         last_date = last_check.date()
         today_date = now.date()
 

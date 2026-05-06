@@ -735,21 +735,38 @@ quirks here:
    (LTE is the only WAN); same for the Up columns. We read the LTE
    pair only.
 
-2. **Per-IP downstream is severely under-counted.** Real-world test
-   on 2026-05-04: `/stats.htm lteRx = 2.79 GB` (since boot), while
-   the sum of every row's "Lte Down" was only `619 MB` (78% of
-   received bytes unaccounted-for). Most clients show `0 B` Lte
-   Down even when actively downloading. Upload is closer but still
-   off (~24% missing in the same test). The per-IP counter appears
-   to lose traffic on session ageing / DHCP renewal / NAT table
-   flush; no panel setting fixes it. Counter resets are also more
-   frequent than `/stats.htm` resets — a per-IP cumulative can
-   drop sharply mid-day even without a modem reboot. **Implication
-   for `clients-total_*.txt`**: per-client `receive` numbers will
-   not sum to the global `receive` in `total_*.txt`. The global
-   counter is the source of truth for daily totals; per-client is
-   best-effort attribution only — useful for ranking heavy users
-   but not for absolute accounting.
+2. **Per-IP counter is unstable in BOTH directions.**
+
+   *Under-counting:* real-world test on 2026-05-04 mid-day,
+   `/stats.htm lteRx = 2.79 GB` (since boot), while the sum of every
+   row's "Lte Down" was only `619 MB` (78% of received bytes
+   unaccounted-for). Most clients show `0 B` Lte Down even when
+   actively downloading. Upload is closer but still off (~24% missing
+   in the same test). The per-IP counter appears to lose traffic on
+   session ageing / NAT table flush.
+
+   *Over-counting via spurious resets:* the per-IP cumulative drops
+   sharply mid-day without a modem reboot — log evidence shows ~22
+   `cur < last` events for one heavy client during one day. Naive
+   `_delta_with_reset(last, cur) = cur if cur < last else cur - last`
+   adds the post-reset value as fresh usage at every reset, even
+   though no real bytes were lost. Combined with the midnight
+   rollover splitting the spike across days, this produced a
+   recorded `57 GB` daily total for one client on a day when the
+   global only saw `4.58 GB` — a physically-impossible 12.4× over-
+   count.
+
+   *Mitigation in code:* in `UsageTracker.tick()`, after computing
+   `d_per_ip`, sum the per-IP tx and rx deltas; if either sum
+   exceeds the corresponding global delta from `/stats.htm`, scale
+   all per-IP deltas down proportionally so the sum equals the
+   global. The global counter is treated as ground truth and per-IP
+   becomes attribution-by-share. **Implication for
+   `clients-total_*.txt`**: with the cap in place, per-client
+   `receive` numbers sum to **at most** the global `receive` in
+   `total_*.txt` — usually less (because of the under-counting
+   problem above). Per-client is best-effort attribution only —
+   useful for ranking heavy users but not for absolute accounting.
 
 The same IP can appear on multiple `<tr>` rows in one response —
 these are concurrent or historical client sessions for the same IP
