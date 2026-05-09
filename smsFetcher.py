@@ -2207,6 +2207,18 @@ class TelinaWatcher:
         if r.status_code == 401:
             # Drop cached creds; next tick will re-login.
             raise PermissionError("telina: 401 (token rejected)")
+        if 500 <= r.status_code < 600:
+            # The Telina hub returns 5xx (not 401) when a cached token
+            # has aged out — observed 2026-05-08/09 with a token that
+            # had been live since process start on 2026-05-05. Treat
+            # 5xx the same as 401 and let the retry loop re-login once
+            # before propagating. If the server is genuinely 500-ing,
+            # the retry will also fail and the exception bubbles up.
+            preview = r.text[:200].replace("\n", " ")
+            raise PermissionError(
+                f"telina: HTTP {r.status_code} (treating as stale "
+                f"auth); body: {preview!r}"
+            )
         r.raise_for_status()
         data = r.json()
         if "error" in data:
@@ -2249,9 +2261,9 @@ class TelinaWatcher:
     # ---- tick ----
 
     def tick(self):
-        # Lazy login + appId resolution. On 401 mid-run we drop the
-        # cached creds and re-acquire them once before giving up for
-        # this tick.
+        # Lazy login + appId resolution. On 401 (or 5xx, which Telina
+        # uses for stale tokens) we drop the cached creds and re-acquire
+        # them once before giving up for this tick.
         for attempt in (1, 2):
             try:
                 if not self._token or not self._user_id:
