@@ -660,12 +660,15 @@ class Fetcher:
     def _maybe_forward(self, rec: dict, json_path: Path):
         """If `forward_enabled` and the message matches both
         `forward_match_sender` (exact) and `forward_match_substring`
-        (substring; "" means any), rewrite the body via
-        `forward_replacements` (literal) and `forward_regex_replacements`
-        (re.sub), then send it to `telina_notif_number` via the modem.
-        Best-effort: a single attempt, no retry — failures log and move
-        on. Silently suppressed for blocklisted senders (caller already
-        routed those away from this branch).
+        (CSV of substrings — body must contain ANY one; "" means any),
+        rewrite the body and send it to `telina_notif_number` via the
+        modem. Whichever substring matched is auto-stripped (along
+        with the immediately following newline if present) before
+        `forward_replacements` (literal) and
+        `forward_regex_replacements` (re.sub) run. Best-effort: a
+        single attempt, no retry — failures log and move on. Silently
+        suppressed for blocklisted senders (caller already routed
+        those away from this branch).
 
         Note: the modem's send path silently drops UCS-2/Persian sends
         above ~17 chars and ASCII/GSM-7 sends above ~30 chars (see
@@ -681,9 +684,11 @@ class Fetcher:
         sender = str(rec.get("sender", ""))
         if sender != match_sender:
             return
-        match_sub = str(self.cfg.get("forward_match_substring", ""))
+        match_sub_raw = str(self.cfg.get("forward_match_substring", ""))
+        match_subs = [s.strip() for s in match_sub_raw.split(",") if s.strip()]
         body = str(rec.get("body", ""))
-        if match_sub and match_sub not in body:
+        matched_subs = [s for s in match_subs if s in body]
+        if match_subs and not matched_subs:
             return
         local = str(self.cfg.get("telina_notif_number", "")).strip()
         if not local:
@@ -699,14 +704,20 @@ class Fetcher:
         # over-budget body becomes a short ASCII string that fits in a
         # single SMS. Match was against the original body; we send the
         # rewritten one.
+        # 0. Whichever match substring(s) hit are auto-stripped, plus
+        #    the immediately following newline if present. Saves the
+        #    user from having to repeat each match candidate inside
+        #    `forward_replacements`.
         # 1. `forward_replacements` — literal str.replace, applied in
         #    insertion order. Use for transliterations and fixed
-        #    substrings.
+        #    substrings that aren't match candidates.
         # 2. `forward_regex_replacements` — list of [pattern, repl]
         #    pairs, applied in order with re.sub. Use for variable
         #    content like dates and ids.
-        replacements = self.cfg.get("forward_replacements") or {}
         send_body = body
+        for sub in matched_subs:
+            send_body = send_body.replace(sub + "\n", "").replace(sub, "")
+        replacements = self.cfg.get("forward_replacements") or {}
         if isinstance(replacements, dict):
             for src, dst in replacements.items():
                 if src:

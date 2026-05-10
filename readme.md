@@ -399,7 +399,10 @@ SMS against two filters:
 - `forward_match_sender` — the sender id must match exactly (e.g.
   `"B.Pasargad"`). Empty string disables the feature even if
   `forward_enabled` is true.
-- `forward_match_substring` — the body must contain this substring.
+- `forward_match_substring` — comma-separated list of substrings; the
+  body must contain **any one** of them. Useful when the same sender
+  emits several distinct templates (e.g. multiple bank accounts under
+  one alphanumeric sender id) and you want all of them forwarded.
   Empty string means "any body from that sender".
 
 If both filters pass, the Fetcher calls `modem.send_sms` to the
@@ -407,15 +410,21 @@ If both filters pass, the Fetcher calls `modem.send_sms` to the
 (country code from `relay_sms_country_code`, leading `0` stripped from
 the local number — same conversion as the Telina watcher).
 
-Before the body is sent it's run through two rewrite stages, in this
-order — the match check above runs against the **original** body; the
-rewritten body is what actually goes out on the wire:
+Before the body is sent it's run through three rewrite stages, in
+this order — the match check above runs against the **original**
+body; the rewritten body is what actually goes out on the wire:
 
+0. **Auto-strip of matched substrings.** Whichever
+   `forward_match_substring` candidate(s) hit are removed from the
+   body along with the immediately following newline. So if you
+   match `1303.8000.13360737.1,1303.100.13360737.1` and the SMS
+   starts with one of those account ids on its own line, that line
+   is gone before any user-defined rewrite runs — no need to repeat
+   the ids inside `forward_replacements`.
 1. `forward_replacements` — JSON object mapping source string →
    replacement string, applied in insertion order via plain
-   `str.replace`. Use for fixed substrings: transliterations
-   (`"مانده": "MA"`) and known-literal headers
-   (`"1303.8000.13360737.1\n": ""`).
+   `str.replace`. Use for transliterations (`"مانده": "MA"`) and any
+   other fixed substrings that aren't match candidates.
 2. `forward_regex_replacements` — JSON array of `[pattern, repl]`
    pairs, applied in order via Python `re.sub`. Use for variable
    content like dates, amounts, and account ids — anything that
