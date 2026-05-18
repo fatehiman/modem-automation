@@ -31,7 +31,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, ttk
 # Native Windows toasts via windows-toasts proved unreliable here:
 # - Basic WindowsToaster: shows briefly (5–7 s) and auto-dismisses, with no
 #   way to make the toast sticky.
@@ -96,6 +96,12 @@ DEFAULT_CONFIG = {
     "forward_match_substring": "",
     "forward_replacements": {},
     "forward_regex_replacements": [],
+    "ussd_enabled": True,
+    "ussd_state_file": "ussd_state.json",
+    "quota_warn_enabled": True,
+    "quota_warn_sender": "HAMRAHAVAL",
+    "quota_warn_pattern": "برابر با x مگابایت است",
+    "quota_warn_below_mb": 5000,
 }
 
 
@@ -489,6 +495,64 @@ class ModemClient:
                 f"or session lost"
             )
 
+    def ussd_post(self, ussd_value: str = "", select_menu: str = "",
+                  status_input: str = "ussd", cancel: str = "0") -> str:
+        """Submit the /ussd.htm form. Returns the decoded response HTML
+        so the caller can scrape `var ussdStatus` (0=idle, 1=active
+        session — menu OR final reply, 2=Fail/closed) and the
+        ussd_menu_id div content (the network text, with <br> line
+        breaks, rendered server-side). Three call shapes:
+          - send a code:    ussd_post(ussd_value="*10*327#", status_input="ussd")
+          - reply to menu:  ussd_post(select_menu="0", status_input="menu")
+          - cancel session: ussd_post(status_input="menu", cancel="1")
+
+        Note: on this firmware the modem stays in ussdStatus=1 even
+        after the network's final reply — only an explicit cancel moves
+        it to 2. So success detection should match the response text,
+        not status transitions.
+
+        Auth quirk: in the running app — but not in isolated test
+        scripts — formUSSDSetup periodically returns the 108-byte auth
+        stub even with an otherwise-valid cookie (the same cookie that
+        had just successfully fetched /sms_inbox.htm seconds earlier),
+        and the response invalidates the cookie too. We don't fully
+        understand the trigger, but the recovery pattern that other
+        modem methods already use — detect the stub, re-login, retry
+        once — works here. Both attempts also do a GET /ussd.htm first
+        as a defensive "load the page" step before the form submit."""
+        data = {
+            "ussdValue": ussd_value,
+            "selectMenuValue": select_menu,
+            "ussdStatusInput": status_input,
+            "ussdCancelInput": cancel,
+            "submit-url": "/ussd.htm",
+        }
+        headers = {"Referer": f"{self.base}/ussd.htm"}
+
+        def _attempt():
+            self.session.get(f"{self.base}/ussd.htm", timeout=self.timeout)
+            return self.session.post(
+                f"{self.base}/boafrm/formUSSDSetup",
+                data=data, headers=headers,
+                timeout=self.timeout, allow_redirects=True,
+            )
+
+        r = _attempt()
+        if r.status_code == 200 and self._looks_unauthed(r.content):
+            self.logger.info(
+                f"ussd_post: auth stub returned (len={len(r.content)}), "
+                f"re-logging in and retrying"
+            )
+            self.login()
+            r = _attempt()
+        if r.status_code != 200 or self._looks_unauthed(r.content):
+            preview = r.content[:120].decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"ussd_post returned HTTP {r.status_code} "
+                f"or session lost (len={len(r.content)}, body={preview!r})"
+            )
+        return r.content.decode("utf-8", errors="replace")
+
     # --- Usage statistics ---
     # /stats.htm renders LTE Tx/Rx as JS variables in the page body:
     #     var lteTx="<bytes_sent>";
@@ -595,6 +659,49 @@ def save_sms(record: dict, sms_dir: Path, modem_url: str) -> Path:
     return path
 
 
+# ---------- remained-quota log ----------
+
+QUOTA_LOG_FILENAME = "remained_quota_sms.txt"
+
+
+def quota_log_path(cfg: dict) -> Path:
+    """Sibling of the per-day usage files. Shared by the live Fetcher
+    hook and `backfill_quota_log.py` so both write the same file."""
+    return app_dir() / cfg["usage_total_folder"] / QUOTA_LOG_FILENAME
+
+
+def parse_quota_received_at(received_at: str) -> str:
+    """Render an SMS `received_at` (`YYYY-MM-DD HH:MM:SS`) as the
+    `YYYY/MM/DD HH:MM:SS` log timestamp. Falls back to current local
+    time if the input is unparseable."""
+    try:
+        dt = datetime.strptime(received_at, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        dt = datetime.now()
+    return dt.strftime("%Y/%m/%d %H:%M:%S")
+
+
+def write_quota_line(log_path: Path, ts: str, mb: int):
+    """Insert (or overwrite, keyed by timestamp prefix) one `ts mb`
+    line in `log_path`. File stays sorted chronologically. Atomic via
+    `.tmp` + replace. Sub-second collisions from the SIM are effectively
+    impossible, so the timestamp prefix is a unique key per SMS."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    if log_path.exists():
+        for raw in log_path.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            if raw.startswith(ts + " "):
+                continue
+            lines.append(raw)
+    lines.append(f"{ts} {mb}")
+    lines.sort()
+    tmp = log_path.with_suffix(".txt.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(log_path)
+
+
 # ---------- state (pending deletions) ----------
 
 class State:
@@ -634,6 +741,10 @@ class Fetcher:
         self.del_dir = app_dir() / cfg["notified_folder"]
         self.state = State(app_dir() / cfg["state_file"])
         self.blacklist: "Blacklist | None" = None
+        # Set by main() before the thread starts when quota_warn is enabled.
+        # `enqueue(mb)` is called from `_maybe_quota_warn` on low-quota SMS;
+        # the warner's own tick gates the actual popup on DND clearing.
+        self.quota_warner: "QuotaWarner | None" = None
         self._stop = threading.Event()
         self._wake = threading.Event()
 
@@ -759,6 +870,81 @@ class Fetcher:
                 exc_info=True,
             )
 
+    def _log_quota_line(self, rec: dict, mb: int):
+        try:
+            ts = parse_quota_received_at(str(rec.get("received_at") or ""))
+            log_path = quota_log_path(self.cfg)
+            write_quota_line(log_path, ts, mb)
+            self.logger.info(
+                f"quota: logged {ts} {mb} -> {log_path.name}"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"quota: failed to write {QUOTA_LOG_FILENAME}: {e}",
+                exc_info=True,
+            )
+
+    def _maybe_quota_warn(self, rec: dict):
+        """If `quota_warn_enabled` and the SMS sender matches
+        `quota_warn_sender`, parse the body against `quota_warn_pattern`
+        (with `x` as the integer placeholder, the rest matched as a
+        regex-escaped literal) and enqueue a quota-low warning when the
+        parsed MB is below `quota_warn_below_mb`. Logs every step so a
+        broken pattern is debuggable from the log alone."""
+        if not self.cfg.get("quota_warn_enabled", True):
+            return
+        want_sender = str(self.cfg.get("quota_warn_sender") or "").strip()
+        if not want_sender:
+            return
+        sender = str(rec.get("sender") or "").strip()
+        if sender != want_sender:
+            return
+        pattern = str(self.cfg.get("quota_warn_pattern") or "")
+        if "x" not in pattern:
+            self.logger.warning(
+                "quota: quota_warn_pattern has no 'x' placeholder, "
+                "skipping parse"
+            )
+            return
+        # Build regex: everything except the first `x` is a literal; the
+        # `x` becomes a digit-capture. Keeping it to the first `x` avoids
+        # surprises if the pattern legitimately contains other `x`s.
+        before, after = pattern.split("x", 1)
+        regex = re.escape(before) + r"(\d+)" + re.escape(after)
+        body = str(rec.get("body") or "")
+        m = re.search(regex, body)
+        if not m:
+            self.logger.info(
+                f"quota: sender match but pattern did not match body "
+                f"(pattern={pattern!r})"
+            )
+            return
+        try:
+            mb = int(m.group(1))
+        except (ValueError, IndexError):
+            self.logger.warning(
+                f"quota: matched but could not parse int from "
+                f"{m.group(0)!r}"
+            )
+            return
+        threshold = int(self.cfg.get("quota_warn_below_mb", 5000))
+        self.logger.info(
+            f"quota: parsed {mb} MB from sender={sender} "
+            f"(threshold={threshold} MB)"
+        )
+        # File log is independent of the threshold — captures every
+        # parsed quota value so a history is built up. The popup gate
+        # below still uses the threshold.
+        self._log_quota_line(rec, mb)
+        if mb >= threshold:
+            return
+        if self.quota_warner is None:
+            self.logger.warning(
+                "quota: below threshold but no warner is wired up"
+            )
+            return
+        self.quota_warner.enqueue(mb)
+
     def cycle(self):
         records = self.modem.list_sms()
         self.logger.info(f"polled inbox: {len(records)} message(s) present")
@@ -798,6 +984,10 @@ class Fetcher:
                     f"received_at='{rec['received_at']}' -> {path.name}"
                 )
                 self._maybe_forward(rec, path)
+            # Quota check is independent of the blacklist — even if the
+            # user has muted HAMRAHAVAL's regular notifications, the
+            # quota-low warning still fires.
+            self._maybe_quota_warn(rec)
             new_count += 1
             if not self.cfg.get("delete_after_save", True):
                 continue
@@ -2349,18 +2539,400 @@ class TelinaWatcher:
         self._save_state(calls)
 
 
+# ---------- daily USSD trigger ----------
+
+class UssdWatcher:
+    """Once-per-day USSD trigger: ``*10*327#`` → reply ``0`` → cancel,
+    via the modem panel's /boafrm/formUSSDSetup form. The operator
+    requires this periodic ping to keep the unlimited-data add-on
+    (``اشتراک پرو``) active.
+
+    User confirmation: the flow disconnects the LTE link briefly while
+    the modem talks to the network, so we don't fire silently — a Tk
+    modal pops up first with Snooze / Go ahead / Cancel and a 30-second
+    countdown that auto-clicks Go ahead if the user is away. See
+    `show_ussd_confirm_modal`.
+
+    Day tracking: ``last_run_date`` is persisted in
+    ``ussd_state_file``. When today's local date differs we are due;
+    Go-ahead success OR Cancel writes today's date so we won't fire
+    again until tomorrow. Failures leave it unwritten so the next tick
+    re-asks — but a 1-hour cooldown is applied first to avoid spamming
+    the user when the modem stays uncooperative. Snooze is in-memory
+    only (a restart re-evaluates from the persisted date alone).
+
+    The modal is deferred while Windows is in DND / Focus Assist /
+    fullscreen, the same as the SMS popups."""
+
+    USSD_CODE = "*10*327#"
+    USSD_PICK = "0"
+    # Substring that proves the operator menu we expected was returned.
+    # Full menu: "اشتراک پرو\n0.استعلام\n1.وصل\n2.قطع\n3.خرید اشتراک\n…".
+    MENU_EXPECTED = "اشتراک پرو"
+    # Substring that proves the '0' reply was processed.
+    # Full reply: "مشترک گرامی درخواست شما بررسی و نتیجه از طریق پیامک …".
+    RESULT_EXPECTED = "درخواست شما"
+
+    TICK_SECONDS = 60
+    FAILURE_COOLDOWN_SECONDS = 3600
+
+    _STATUS_RE = re.compile(r"var\s+ussdStatus\s*=\s*'(\d+)'")
+    _MENU_DIV_RE = re.compile(
+        r'<div id="ussd_menu_id">(.*?)</div>', re.DOTALL,
+    )
+
+    def __init__(self, cfg: dict, logger: logging.Logger,
+                 modem: ModemClient, ui_queue: "queue.Queue",
+                 on_state_change=None):
+        self.cfg = cfg
+        self.logger = logger
+        self.modem = modem
+        self.ui_queue = ui_queue
+        # Optional callback fired with True when the flow starts and
+        # False when it ends — main() uses this to flip the tray icon
+        # to its USSD-running colour.
+        self._on_state_change = on_state_change
+        self.state_path = app_dir() / cfg["ussd_state_file"]
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        # In-memory only — both reset on restart.
+        self._snooze_until: "float | None" = None
+        self._failure_until: "float | None" = None
+        self._modal_lock = threading.Lock()
+        self._modal_pending = False
+        # Single-flight guard so a manual tray trigger can't pile on
+        # top of an in-progress modal-Go flow (or vice versa).
+        self._flow_lock = threading.Lock()
+        self._flow_in_progress = False
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def trigger_now_force(self):
+        """Manual fire from the tray menu. Ignores today's `last_run_date`,
+        the DND state, snooze and the failure cooldown — runs the flow
+        immediately. On success, today is still marked done so the
+        scheduled daily modal won't fire again. No-op if a flow is
+        already running."""
+        with self._flow_lock:
+            if self._flow_in_progress:
+                self.logger.info(
+                    "ussd: manual trigger ignored — a flow is already running"
+                )
+                return
+            self._flow_in_progress = True
+        self.logger.info("ussd: manual trigger — running flow")
+        threading.Thread(
+            target=self._do_flow, daemon=True, name="ussd-manual",
+            args=("manual",),
+        ).start()
+
+    def _set_running(self, on: bool):
+        if self._on_state_change is not None:
+            try:
+                self._on_state_change(on)
+            except Exception as e:
+                self.logger.error(f"ussd: state-change cb error: {e}")
+
+    # ---- state ----
+
+    def _today(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _load_last_run_date(self) -> "str | None":
+        if not self.state_path.exists():
+            return None
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            d = data.get("last_run_date")
+            return str(d) if d else None
+        except Exception as e:
+            self.logger.error(f"ussd state load failed: {e}")
+            return None
+
+    def _save_done_today(self):
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"last_run_date": self._today()}, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.state_path)
+        except Exception as e:
+            self.logger.error(f"ussd state save failed: {e}")
+
+    # ---- response parsing ----
+
+    @classmethod
+    def _ussd_status(cls, html_body: str) -> "str | None":
+        m = cls._STATUS_RE.search(html_body)
+        return m.group(1) if m else None
+
+    @classmethod
+    def _menu_text(cls, html_body: str) -> str:
+        m = cls._MENU_DIV_RE.search(html_body)
+        if not m:
+            return ""
+        # Strip tags, normalise whitespace. <br> separators in the
+        # network text become spaces — fine for a substring check.
+        inner = re.sub(r"<[^>]+>", " ", m.group(1))
+        return re.sub(r"\s+", " ", inner).strip()
+
+    # ---- modal dispatch ----
+
+    def _show_modal(self):
+        with self._modal_lock:
+            if self._modal_pending:
+                return
+            self._modal_pending = True
+        self.ui_queue.put(
+            ("ussd_confirm", {"on_result": self._on_modal_result})
+        )
+        self.logger.info("ussd: confirmation modal queued")
+
+    def _on_modal_result(self, action: str, snooze_minutes: int = 0):
+        """Tk-thread callback fired exactly once when the modal closes."""
+        with self._modal_lock:
+            self._modal_pending = False
+        if action == "go":
+            with self._flow_lock:
+                if self._flow_in_progress:
+                    self.logger.info(
+                        "ussd: modal Go ignored — a flow is already running"
+                    )
+                    return
+                self._flow_in_progress = True
+            # Run on a worker thread so the Tk main loop stays responsive
+            # during the modem round-trips (~5–10 s).
+            threading.Thread(
+                target=self._do_flow, daemon=True, name="ussd-flow",
+                args=("daily",),
+            ).start()
+        elif action == "snooze":
+            self._snooze_until = time.monotonic() + snooze_minutes * 60
+            self.logger.info(f"ussd: snoozed for {snooze_minutes} min")
+            self._wake.set()
+        elif action == "cancel":
+            self._save_done_today()
+            self.logger.info("ussd: cancelled — marked done for today")
+            self._wake.set()
+
+    # ---- flow ----
+
+    def _do_flow(self, label: str):
+        """Worker-thread entry for both the modal Go-ahead and the
+        manual tray trigger. Caller must have set `_flow_in_progress`
+        to True under `_flow_lock`; this method clears it on exit and
+        signals the icon-state callback for the duration of the run."""
+        self._set_running(True)
+        try:
+            ok = self._run_flow()
+            if ok:
+                self._save_done_today()
+                self.logger.info(
+                    f"ussd: {label} flow ok, marked done for today"
+                )
+            else:
+                self._failure_until = (
+                    time.monotonic() + self.FAILURE_COOLDOWN_SECONDS
+                )
+                self.logger.warning(
+                    f"ussd: {label} flow failed; cooldown "
+                    f"{self.FAILURE_COOLDOWN_SECONDS // 60} min before retry"
+                )
+        finally:
+            self._set_running(False)
+            with self._flow_lock:
+                self._flow_in_progress = False
+            self._wake.set()
+
+    def _run_flow(self) -> bool:
+        # Defensive pre-cancel — if a previous session is still hanging
+        # on the modem (e.g. a panel left open in a browser tab), this
+        # clears it so our menu probe lands cleanly.
+        try:
+            self.modem.ussd_post(status_input="menu", cancel="1")
+        except Exception as e:
+            self.logger.warning(f"ussd: pre-reset failed (continuing): {e}")
+        try:
+            html_body = self.modem.ussd_post(
+                ussd_value=self.USSD_CODE, status_input="ussd", cancel="0",
+            )
+            menu = self._menu_text(html_body)
+            self.logger.info(
+                f"ussd: sent {self.USSD_CODE}, "
+                f"status={self._ussd_status(html_body)}, "
+                f"menu={menu[:160]!r}"
+            )
+            if self.MENU_EXPECTED not in menu:
+                self.logger.error(
+                    f"ussd: expected menu substring "
+                    f"{self.MENU_EXPECTED!r} not found"
+                )
+                self._safe_cancel()
+                return False
+
+            html_body = self.modem.ussd_post(
+                select_menu=self.USSD_PICK, status_input="menu", cancel="0",
+            )
+            result = self._menu_text(html_body)
+            self.logger.info(
+                f"ussd: sent pick={self.USSD_PICK!r}, "
+                f"status={self._ussd_status(html_body)}, "
+                f"result={result[:240]!r}"
+            )
+            if self.RESULT_EXPECTED not in result:
+                self.logger.error(
+                    f"ussd: expected result substring "
+                    f"{self.RESULT_EXPECTED!r} not found"
+                )
+                self._safe_cancel()
+                return False
+
+            self._safe_cancel()
+            return True
+        except Exception as e:
+            self.logger.error(f"ussd: flow error: {e}", exc_info=True)
+            self._safe_cancel()
+            return False
+
+    def _safe_cancel(self):
+        try:
+            self.modem.ussd_post(status_input="menu", cancel="1")
+            self.logger.info("ussd: session cancelled")
+        except Exception as e:
+            self.logger.warning(f"ussd: cancel failed: {e}")
+
+    # ---- tick ----
+
+    def tick(self):
+        with self._modal_lock:
+            if self._modal_pending:
+                return
+        if self._load_last_run_date() == self._today():
+            return
+        if not accepts_notifications():
+            return
+        now = time.monotonic()
+        if self._snooze_until is not None:
+            if now < self._snooze_until:
+                return
+            self._snooze_until = None
+        if self._failure_until is not None:
+            if now < self._failure_until:
+                return
+            self._failure_until = None
+        self._show_modal()
+
+    def run(self):
+        # Brief startup grace so the rest of the app fully initialises
+        # (and the tray icon is up) before we possibly pop the modal.
+        if self._stop.wait(15):
+            return
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception as e:
+                self.logger.error(f"ussd: tick error: {e}", exc_info=True)
+            self._wake.clear()
+            self._wake.wait(self.TICK_SECONDS)
+
+
+# ---------- quota-low warning ----------
+
+class QuotaWarner:
+    """Drains a FIFO of quota-low warnings into bottom-right Tk popups,
+    one at a time, only while Windows accepts notifications. The
+    Fetcher calls `enqueue(mb)` when it parses a low-quota SMS; the
+    popup may appear seconds or hours later, depending on DND state.
+
+    Why a separate thread instead of dispatching the popup straight
+    from the Fetcher: SMS receipt happens during the Fetcher's modem
+    poll, but the popup needs to defer under DND/Focus Assist/
+    fullscreen (same as the SMS toast popups). Keeping the queue here
+    decouples those two concerns and means a backlog of warnings
+    drains cleanly when the user comes out of DND."""
+
+    TICK_SECONDS = 15
+
+    def __init__(self, ui_queue: "queue.Queue", logger: logging.Logger):
+        self.ui_queue = ui_queue
+        self.logger = logger
+        self._pending: "list[int]" = []
+        self._lock = threading.Lock()
+        self._showing = False
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def enqueue(self, mb: int):
+        """Called from the Fetcher thread when a low-quota SMS arrives.
+        The user asked for the warning to fire **every** receipt, so we
+        don't dedupe — each call queues a fresh popup."""
+        with self._lock:
+            self._pending.append(int(mb))
+        self.logger.info(
+            f"quota: enqueued warning for {mb} MB "
+            f"(pending={len(self._pending)})"
+        )
+        self._wake.set()
+
+    def _on_ack(self):
+        # Tk-thread callback: popup just closed. Allow the next tick to
+        # show another one (if any are queued and DND is clear).
+        with self._lock:
+            self._showing = False
+        self._wake.set()
+
+    def tick(self):
+        with self._lock:
+            if self._showing or not self._pending:
+                return
+        if not accepts_notifications():
+            return
+        with self._lock:
+            mb = self._pending.pop(0)
+            self._showing = True
+        self.ui_queue.put(
+            ("show_quota_warning", {"mb": mb, "on_ack": self._on_ack})
+        )
+        self.logger.info(f"quota: showing warning popup for {mb} MB")
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception as e:
+                self.logger.error(
+                    f"quota: tick error: {e}", exc_info=True,
+                )
+            self._wake.clear()
+            self._wake.wait(self.TICK_SECONDS)
+
+
 # ---------- tray icon image ----------
 
-def make_icon_image(unread: int = 0, relaying: bool = False) -> Image.Image:
-    """Black 'S' on a filled circle, transparent background. Three states:
-    yellow while a relay (FTP upload + outbound SMS) is in flight, red
-    while toasts are awaiting acknowledgement, green when idle. Yellow
-    wins over red because it is transient and meaningful (the user is
+def make_icon_image(unread: int = 0, relaying: bool = False,
+                    ussd_running: bool = False) -> Image.Image:
+    """Black 'S' on a filled circle, transparent background. Four states:
+    orange while the daily USSD trigger is mid-flight (the LTE link
+    drops briefly while the modem talks to the network), yellow while
+    a relay (FTP upload + outbound SMS) is in flight, red while toasts
+    are awaiting acknowledgement, green when idle. Orange wins over
+    yellow because USSD is the more user-impactful event; yellow wins
+    over red because it is transient and meaningful (the user is
     actively being forwarded an SMS via the modem)."""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    if relaying:
+    if ussd_running:
+        circle_fill = (255, 140, 0, 255)
+    elif relaying:
         circle_fill = (240, 200, 0, 255)
     elif unread > 0:
         circle_fill = (210, 30, 30, 255)
@@ -2551,6 +3123,80 @@ def show_toast_popup(parent: tk.Tk, sender: str, body: str, on_ack):
     body_lbl.bind("<Button-1>", lambda _e: _close("open"))
 
 
+# Distinct accent for the quota-low warning so it's visually separable
+# from a regular SMS toast when both are on screen at the same time.
+POPUP_ACCENT_WARN = "#e07a3a"  # orange
+
+
+def show_quota_warning_popup(parent: tk.Tk, mb: int, on_ack):
+    """Bottom-right Tk warning popup with the parsed remaining quota
+    (MB). Stacks alongside SMS toasts via the same TOAST_SLOTS, with
+    an orange accent bar instead of blue to flag it as a warning.
+    on_ack() is called exactly once when the popup is dismissed."""
+    slot = TOAST_SLOTS.claim()
+    win = tk.Toplevel(parent)
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    win.configure(bg=POPUP_BG)
+
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = sw - POPUP_W - POPUP_RIGHT_MARGIN
+    y = sh - POPUP_BOTTOM_MARGIN - (slot + 1) * (POPUP_H + POPUP_GAP)
+    win.geometry(f"{POPUP_W}x{POPUP_H}+{x}+{y}")
+
+    closed = {"v": False}
+
+    def _close():
+        if closed["v"]:
+            return
+        closed["v"] = True
+        TOAST_SLOTS.release(slot)
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        try:
+            on_ack()
+        except Exception:
+            pass
+
+    bar = tk.Frame(win, bg=POPUP_ACCENT_WARN, width=4)
+    bar.pack(side="left", fill="y")
+
+    inner = tk.Frame(win, bg=POPUP_BG)
+    inner.pack(side="left", fill="both", expand=True)
+
+    header = tk.Frame(inner, bg=POPUP_BG)
+    header.pack(fill="x", padx=10, pady=(8, 2))
+    tk.Label(
+        header, text="Internet quota low",
+        bg=POPUP_BG, fg=POPUP_FG,
+        font=("Segoe UI", 10, "bold"),
+    ).pack(side="left")
+    xbtn = tk.Label(
+        header, text="×",
+        bg=POPUP_BG, fg=POPUP_FG_MUTED,
+        font=("Segoe UI", 14, "bold"),
+        cursor="hand2",
+    )
+    xbtn.pack(side="right")
+    xbtn.bind("<Button-1>", lambda _e: _close())
+
+    btns = tk.Frame(inner, bg=POPUP_BG)
+    btns.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+    tk.Button(
+        btns, text="Dismiss", width=10, height=1, command=_close,
+    ).pack(side="right")
+
+    tk.Label(
+        inner, text=f"Internet quota is low: {mb} MB remaining.",
+        bg=POPUP_BG, fg=POPUP_FG,
+        font=("Tahoma", 10),
+        wraplength=POPUP_W - 30, justify="left", anchor="nw",
+    ).pack(fill="both", expand=True, padx=10, pady=2)
+
+
 def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
     """Show SMS detail modal. on_close (optional) is invoked exactly once
     when the window is closed via Close button, Esc, or the X."""
@@ -2611,6 +3257,125 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
     # park focus on the body so Ctrl+A / Ctrl+C target the SMS text.
     win.focus_force()
     txt.focus_set()
+
+
+def show_ussd_confirm_modal(parent: tk.Tk, on_result):
+    """Confirmation modal before the daily USSD trigger fires. Calls
+    `on_result(action, snooze_minutes)` exactly once with action in
+    {"go", "snooze", "cancel"}; snooze_minutes is meaningful only when
+    action == "snooze".
+
+    A 30-second countdown auto-clicks Go ahead if the user does
+    nothing — the daily trigger should not be silently blocked by a
+    forgotten modal."""
+    snooze_options = [
+        ("10min", 10),
+        ("30min", 30),
+        ("1 hour", 60),
+        ("2 hours", 120),
+        ("3 hours", 180),
+    ]
+    countdown_seconds = 30
+
+    win = tk.Toplevel(parent)
+    win.title(f"{APP_NAME} - Send USSD?")
+    win.attributes("-topmost", True)
+    win.resizable(False, False)
+
+    state = {"closed": False, "remaining": countdown_seconds}
+
+    def _close(action: str, snooze_min: int = 0):
+        if state["closed"]:
+            return
+        state["closed"] = True
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        try:
+            on_result(action, snooze_min)
+        except Exception:
+            pass
+
+    body = tk.Frame(win, padx=16, pady=14)
+    body.pack(fill="both", expand=True)
+
+    tk.Label(
+        body,
+        text=("Ready to send USSD code?\n"
+              "Internet will be disconnected for a while."),
+        justify="left", anchor="w", font=("Segoe UI", 10),
+    ).pack(fill="x", pady=(0, 12))
+
+    snooze_row = tk.Frame(body)
+    snooze_row.pack(fill="x", pady=(0, 14))
+    tk.Label(
+        snooze_row, text="Snooze time: ", font=("Segoe UI", 10),
+    ).pack(side="left")
+    snooze_var = tk.StringVar(value=snooze_options[0][0])
+    combo = ttk.Combobox(
+        snooze_row, textvariable=snooze_var,
+        values=[lbl for lbl, _ in snooze_options],
+        state="readonly", width=10,
+    )
+    combo.pack(side="left")
+
+    btns = tk.Frame(body)
+    btns.pack(fill="x")
+
+    def _on_cancel():
+        _close("cancel")
+
+    def _on_snooze():
+        sel = snooze_var.get()
+        mins = next((m for lbl, m in snooze_options if lbl == sel),
+                    snooze_options[0][1])
+        _close("snooze", mins)
+
+    def _on_go():
+        _close("go")
+
+    cancel_btn = tk.Button(btns, text="Cancel", width=12, command=_on_cancel)
+    cancel_btn.pack(side="left")
+    snooze_btn = tk.Button(btns, text="Snooze", width=12, command=_on_snooze)
+    snooze_btn.pack(side="left", padx=(8, 0))
+    go_btn = tk.Button(
+        btns, text=f"Go ahead! ({countdown_seconds})",
+        width=18, command=_on_go,
+    )
+    go_btn.pack(side="right")
+
+    def _tick():
+        if state["closed"]:
+            return
+        state["remaining"] -= 1
+        if state["remaining"] <= 0:
+            _close("go")
+            return
+        try:
+            go_btn.config(text=f"Go ahead! ({state['remaining']})")
+        except Exception:
+            return
+        win.after(1000, _tick)
+
+    win.after(1000, _tick)
+    win.protocol("WM_DELETE_WINDOW", _on_cancel)
+    win.bind("<Escape>", lambda _e: _on_cancel())
+
+    # Centre roughly on the primary screen.
+    win.update_idletasks()
+    w = max(win.winfo_width(), 380)
+    h = max(win.winfo_height(), 140)
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = (sw - w) // 2
+    y = (sh - h) // 3
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+    win.lift()
+    win.focus_force()
+    go_btn.focus_set()
+    win.after(300, lambda: win.attributes("-topmost", False))
 
 
 # ---------- main ----------
@@ -2676,8 +3441,20 @@ def main() -> int:
 
     blacklist = Blacklist(app_dir() / cfg["blacklist_file"], logger)
 
+    # Quota-low warner — must be wired into the Fetcher BEFORE its
+    # thread starts so the first incoming SMS can already enqueue.
+    quota_warner: "QuotaWarner | None" = None
+    if cfg.get("quota_warn_enabled", True):
+        quota_warner = QuotaWarner(ui_queue, logger)
+        quota_thread = threading.Thread(target=quota_warner.run, daemon=True)
+        quota_thread.start()
+        logger.info("quota: warner thread started")
+    else:
+        logger.info("quota: disabled in config")
+
     fetcher = Fetcher(cfg, logger)
     fetcher.blacklist = blacklist
+    fetcher.quota_warner = quota_warner
     fetcher_thread = threading.Thread(target=fetcher.run, daemon=True)
     fetcher_thread.start()
 
@@ -2688,23 +3465,31 @@ def main() -> int:
     usage_thread.start()
 
     icon_holder = {"icon": None}
-    icon_state = {"unread": 0, "relaying": False}
+    icon_state = {"unread": 0, "relaying": False, "ussd_running": False}
     icon_state_lock = threading.Lock()
 
     def _refresh_icon():
-        # Yellow (relaying) wins over red (unread) wins over green
-        # (idle). pystray supports updating icon.icon and icon.title
-        # from any thread, but bouncing through one helper keeps the
-        # state machine in one place.
+        # Orange (USSD running) wins over yellow (relaying) wins over
+        # red (unread) wins over green (idle). pystray supports updating
+        # icon.icon and icon.title from any thread, but bouncing through
+        # one helper keeps the state machine in one place.
         icon = icon_holder.get("icon")
         if icon is None:
             return
         with icon_state_lock:
             unread = icon_state["unread"]
             relaying = icon_state["relaying"]
+            ussd_running = icon_state["ussd_running"]
         try:
-            icon.icon = make_icon_image(unread=unread, relaying=relaying)
-            if relaying:
+            icon.icon = make_icon_image(
+                unread=unread, relaying=relaying, ussd_running=ussd_running,
+            )
+            if ussd_running:
+                icon.title = (
+                    f"{APP_NAME} (running USSD, {unread} unread)" if unread
+                    else f"{APP_NAME} (running USSD)"
+                )
+            elif relaying:
                 icon.title = (
                     f"{APP_NAME} (relaying, {unread} unread)" if unread
                     else f"{APP_NAME} (relaying)"
@@ -2727,6 +3512,12 @@ def main() -> int:
             icon_state["relaying"] = on
         _refresh_icon()
         logger.info(f"icon: relaying={on}")
+
+    def on_ussd_state_change(on: bool):
+        with icon_state_lock:
+            icon_state["ussd_running"] = on
+        _refresh_icon()
+        logger.info(f"icon: ussd_running={on}")
 
     notifier = Notifier(
         cfg, logger, ui_queue,
@@ -2755,9 +3546,33 @@ def main() -> int:
     else:
         logger.info("telina: disabled in config")
 
+    # Daily USSD trigger. Same isolation principle as Telina — exceptions
+    # are caught and logged inside tick(), and the modal-confirmation
+    # gate makes sure no internet outage happens without user consent.
+    ussd: "UssdWatcher | None" = None
+    if cfg.get("ussd_enabled", True):
+        ussd = UssdWatcher(
+            cfg, logger, fetcher.modem, ui_queue,
+            on_state_change=on_ussd_state_change,
+        )
+        ussd_thread = threading.Thread(target=ussd.run, daemon=True)
+        ussd_thread.start()
+        logger.info("ussd: watcher thread started")
+    else:
+        logger.info("ussd: disabled in config")
+
     def on_log(_icon, _item):
         logger.info("tray: Log clicked")
         ui_queue.put("show_log")
+
+    def on_send_ussd(_icon, _item):
+        logger.info("tray: Send USSD clicked")
+        if ussd is None:
+            logger.warning(
+                "tray: Send USSD ignored — ussd_enabled is false"
+            )
+            return
+        ussd.trigger_now_force()
 
     def on_exit(_icon, _item):
         logger.info("tray: Exit clicked")
@@ -2807,12 +3622,47 @@ def main() -> int:
                         logger.error(
                             f"opening toast popup failed: {e}", exc_info=True
                         )
+                elif cmd == "ussd_confirm":
+                    on_result = (payload or {}).get("on_result")
+                    try:
+                        show_ussd_confirm_modal(root, on_result=on_result)
+                    except Exception as e:
+                        logger.error(
+                            f"opening ussd modal failed: {e}", exc_info=True
+                        )
+                        # Keep the watcher unblocked: signal cancel so
+                        # its modal-pending flag clears.
+                        if on_result:
+                            try:
+                                on_result("cancel", 0)
+                            except Exception:
+                                pass
+                elif cmd == "show_quota_warning":
+                    on_ack = (payload or {}).get("on_ack")
+                    mb = int((payload or {}).get("mb", 0))
+                    try:
+                        show_quota_warning_popup(root, mb=mb, on_ack=on_ack)
+                    except Exception as e:
+                        logger.error(
+                            f"opening quota popup failed: {e}", exc_info=True
+                        )
+                        # Free the warner's _showing flag so the queue
+                        # can keep draining.
+                        if on_ack:
+                            try:
+                                on_ack()
+                            except Exception:
+                                pass
                 elif cmd == "exit":
                     logger.info(f"--- {APP_NAME} stopping ---")
                     fetcher.stop()
                     notifier.stop()
                     usage.stop()
                     relayer.stop()
+                    if ussd is not None:
+                        ussd.stop()
+                    if quota_warner is not None:
+                        quota_warner.stop()
                     try:
                         icon_holder["icon"].stop()
                     except Exception:
@@ -2824,14 +3674,16 @@ def main() -> int:
 
     root.after(100, pump_ui)
 
+    menu_items = [pystray.MenuItem("Log", on_log)]
+    if ussd is not None:
+        menu_items.append(pystray.MenuItem("Send USSD", on_send_ussd))
+    menu_items.append(pystray.MenuItem("Exit", on_exit))
+
     icon = pystray.Icon(
         APP_NAME,
         make_icon_image(),
         APP_NAME,
-        menu=pystray.Menu(
-            pystray.MenuItem("Log", on_log),
-            pystray.MenuItem("Exit", on_exit),
-        ),
+        menu=pystray.Menu(*menu_items),
     )
     icon_holder["icon"] = icon
     threading.Thread(target=icon.run, daemon=True).start()
@@ -2843,6 +3695,10 @@ def main() -> int:
         notifier.stop()
         usage.stop()
         relayer.stop()
+        if ussd is not None:
+            ussd.stop()
+        if quota_warner is not None:
+            quota_warner.stop()
         try:
             icon.stop()
         except Exception:
