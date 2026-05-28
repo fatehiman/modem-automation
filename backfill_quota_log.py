@@ -2,12 +2,17 @@
 backfill_quota_log.py — one-shot pass over sms_del/ to populate
 usage_total/remained_quota_sms.txt from historical SMSes.
 
-Reads smsFetcher.conf for `quota_warn_sender`, `quota_warn_pattern`,
-`notified_folder` and `usage_total_folder`, walks every JSON in
-sms_del/, applies the same sender+regex parse the live Fetcher uses,
-and writes each matched (timestamp, MB) pair into the log file via
-the shared `write_quota_line` helper. Safe to re-run — entries with
-the same timestamp are overwritten, not duplicated.
+This script targets historical operator quota-status SMSes — the
+"HAMRAHAVAL" sender + "برابر با N مگابایت است" pattern that smsFetcher
+used to parse at receipt time (replaced in 2026-05 by the my.mci.ir
+panel scrape; see the README's "Remaining-quota check via MCI panel"
+section). The values are hardcoded here so this script keeps working
+after those config keys were removed from smsFetcher.conf. It walks
+every JSON in sms_del/ and writes each matched (timestamp, MB) pair
+into `usage_total/remained_quota_sms.txt`. Safe to re-run — entries
+with the same timestamp are overwritten, not duplicated. The output
+file is distinct from the new MCI-panel log (`remained_quota.txt`)
+so the two histories stay separate.
 
 Usage:
     python backfill_quota_log.py
@@ -31,17 +36,22 @@ from smsFetcher import (
 )
 
 
+# Historical operator constants — used to be in smsFetcher.conf as
+# `quota_warn_sender` / `quota_warn_pattern`. The live app no longer
+# parses operator SMSes for quota; this script remains as a one-shot
+# extractor for the historical SMS archive.
+HISTORICAL_QUOTA_SENDER = "HAMRAHAVAL"
+HISTORICAL_QUOTA_PATTERN = "برابر با x مگابایت است"
+
+
 def main() -> int:
     cfg, cfg_path = load_or_create_config()
     print(f"using config: {cfg_path}")
 
-    want_sender = str(cfg.get("quota_warn_sender") or "").strip()
-    pattern = str(cfg.get("quota_warn_pattern") or "")
-    if not want_sender:
-        print("error: quota_warn_sender is empty in config")
-        return 1
+    want_sender = HISTORICAL_QUOTA_SENDER
+    pattern = HISTORICAL_QUOTA_PATTERN
     if "x" not in pattern:
-        print("error: quota_warn_pattern has no 'x' placeholder")
+        print("error: HISTORICAL_QUOTA_PATTERN has no 'x' placeholder")
         return 1
     before, after = pattern.split("x", 1)
     regex = re.compile(re.escape(before) + r"(\d+)" + re.escape(after))

@@ -31,7 +31,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 import pystray
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import scrolledtext, messagebox
 # Native Windows toasts via windows-toasts proved unreliable here:
 # - Basic WindowsToaster: shows briefly (5–7 s) and auto-dismisses, with no
 #   way to make the toast sticky.
@@ -96,12 +96,15 @@ DEFAULT_CONFIG = {
     "forward_match_substring": "",
     "forward_replacements": {},
     "forward_regex_replacements": [],
-    "ussd_enabled": True,
-    "ussd_state_file": "ussd_state.json",
-    "quota_warn_enabled": True,
-    "quota_warn_sender": "HAMRAHAVAL",
-    "quota_warn_pattern": "برابر با x مگابایت است",
-    "quota_warn_below_mb": 5000,
+    "mci_enabled": True,
+    "mci_username": "9133169571",
+    "mci_interval_seconds": 3600,
+    "mci_state_file": "mci_state.json",
+    "mci_quota_below_gb": 5.0,
+    "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
+    "mci_otp_pattern": r"Code:\s*(\d+)",
+    "mci_otp_wait_seconds": 120,
+    "mci_quota_log_filename": "remained_quota.txt",
 }
 
 
@@ -495,64 +498,6 @@ class ModemClient:
                 f"or session lost"
             )
 
-    def ussd_post(self, ussd_value: str = "", select_menu: str = "",
-                  status_input: str = "ussd", cancel: str = "0") -> str:
-        """Submit the /ussd.htm form. Returns the decoded response HTML
-        so the caller can scrape `var ussdStatus` (0=idle, 1=active
-        session — menu OR final reply, 2=Fail/closed) and the
-        ussd_menu_id div content (the network text, with <br> line
-        breaks, rendered server-side). Three call shapes:
-          - send a code:    ussd_post(ussd_value="*10*327#", status_input="ussd")
-          - reply to menu:  ussd_post(select_menu="0", status_input="menu")
-          - cancel session: ussd_post(status_input="menu", cancel="1")
-
-        Note: on this firmware the modem stays in ussdStatus=1 even
-        after the network's final reply — only an explicit cancel moves
-        it to 2. So success detection should match the response text,
-        not status transitions.
-
-        Auth quirk: in the running app — but not in isolated test
-        scripts — formUSSDSetup periodically returns the 108-byte auth
-        stub even with an otherwise-valid cookie (the same cookie that
-        had just successfully fetched /sms_inbox.htm seconds earlier),
-        and the response invalidates the cookie too. We don't fully
-        understand the trigger, but the recovery pattern that other
-        modem methods already use — detect the stub, re-login, retry
-        once — works here. Both attempts also do a GET /ussd.htm first
-        as a defensive "load the page" step before the form submit."""
-        data = {
-            "ussdValue": ussd_value,
-            "selectMenuValue": select_menu,
-            "ussdStatusInput": status_input,
-            "ussdCancelInput": cancel,
-            "submit-url": "/ussd.htm",
-        }
-        headers = {"Referer": f"{self.base}/ussd.htm"}
-
-        def _attempt():
-            self.session.get(f"{self.base}/ussd.htm", timeout=self.timeout)
-            return self.session.post(
-                f"{self.base}/boafrm/formUSSDSetup",
-                data=data, headers=headers,
-                timeout=self.timeout, allow_redirects=True,
-            )
-
-        r = _attempt()
-        if r.status_code == 200 and self._looks_unauthed(r.content):
-            self.logger.info(
-                f"ussd_post: auth stub returned (len={len(r.content)}), "
-                f"re-logging in and retrying"
-            )
-            self.login()
-            r = _attempt()
-        if r.status_code != 200 or self._looks_unauthed(r.content):
-            preview = r.content[:120].decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"ussd_post returned HTTP {r.status_code} "
-                f"or session lost (len={len(r.content)}, body={preview!r})"
-            )
-        return r.content.decode("utf-8", errors="replace")
-
     # --- Usage statistics ---
     # /stats.htm renders LTE Tx/Rx as JS variables in the page body:
     #     var lteTx="<bytes_sent>";
@@ -741,10 +686,22 @@ class Fetcher:
         self.del_dir = app_dir() / cfg["notified_folder"]
         self.state = State(app_dir() / cfg["state_file"])
         self.blacklist: "Blacklist | None" = None
-        # Set by main() before the thread starts when quota_warn is enabled.
-        # `enqueue(mb)` is called from `_maybe_quota_warn` on low-quota SMS;
-        # the warner's own tick gates the actual popup on DND clearing.
-        self.quota_warner: "QuotaWarner | None" = None
+        # Set by main() after both Fetcher and MciWatcher are
+        # constructed. When non-None, _maybe_dispatch_otp() forwards
+        # the digits from MCI OTP SMSes for verify + deferred quota
+        # fetch. See MciWatcher.on_otp_received.
+        self.mci_watcher: "MciWatcher | None" = None
+        # Pre-compile the OTP-digits regex once. Invalid pattern only
+        # logs at first use; the SMS still saves either way.
+        self._mci_otp_re: "re.Pattern[str] | None" = None
+        try:
+            self._mci_otp_re = re.compile(
+                str(cfg.get("mci_otp_pattern") or r"Code:\s*(\d+)")
+            )
+        except re.error as e:
+            self.logger.error(
+                f"mci_otp_pattern invalid (OTP dispatch disabled): {e}"
+            )
         self._stop = threading.Event()
         self._wake = threading.Event()
 
@@ -761,11 +718,16 @@ class Fetcher:
         except Exception as e:
             self.logger.error(f"initial login failed: {e}")
         while not self._stop.is_set():
+            # Clear BEFORE the cycle so a trigger_now() during the cycle
+            # (e.g. MciWatcher after POSTing send-otp) is captured by the
+            # subsequent wait() and causes an immediate next cycle. The
+            # opposite order (clear after cycle) loses any trigger that
+            # fired while the cycle was running.
+            self._wake.clear()
             try:
                 self.cycle()
             except Exception as e:
                 self.logger.error(f"cycle error: {e}", exc_info=True)
-            self._wake.clear()
             self._wake.wait(self.cfg["poll_interval_seconds"])
 
     def _maybe_forward(self, rec: dict, json_path: Path):
@@ -870,80 +832,47 @@ class Fetcher:
                 exc_info=True,
             )
 
-    def _log_quota_line(self, rec: dict, mb: int):
-        try:
-            ts = parse_quota_received_at(str(rec.get("received_at") or ""))
-            log_path = quota_log_path(self.cfg)
-            write_quota_line(log_path, ts, mb)
-            self.logger.info(
-                f"quota: logged {ts} {mb} -> {log_path.name}"
+    def _is_mci_otp(self, rec: dict) -> bool:
+        """True iff this SMS looks like an MCI panel OTP — body contains
+        the configured `mci_otp_match_substring` (default the Persian
+        'one-time code, My-MCI' header). Such SMSes are routed straight
+        to ``sms_del/`` at save time so they don't pop a toast, and
+        the digits are dispatched to MciWatcher (see
+        `_maybe_dispatch_otp`)."""
+        if not self.cfg.get("mci_enabled", True):
+            return False
+        needle = str(self.cfg.get("mci_otp_match_substring") or "").strip()
+        if not needle:
+            return False
+        body = str(rec.get("body") or "")
+        return needle in body
+
+    def _maybe_dispatch_otp(self, rec: dict):
+        """Extract the OTP digits from the SMS body and hand them to
+        MciWatcher.on_otp_received(). Called from cycle() right after
+        an OTP-shaped SMS is saved. Quiet no-op if the watcher isn't
+        wired up (mci_enabled is false) or the regex doesn't match."""
+        if self.mci_watcher is None or self._mci_otp_re is None:
+            return
+        body = str(rec.get("body") or "")
+        m = self._mci_otp_re.search(body)
+        if not m:
+            self.logger.warning(
+                f"mci_otp: body matched substring but pattern "
+                f"{self._mci_otp_re.pattern!r} did not — no dispatch"
             )
+            return
+        try:
+            code = m.group(1)
+        except IndexError:
+            code = m.group(0)
+        try:
+            self.mci_watcher.on_otp_received(code)
         except Exception as e:
             self.logger.error(
-                f"quota: failed to write {QUOTA_LOG_FILENAME}: {e}",
+                f"mci_otp: dispatch to MciWatcher failed: {e}",
                 exc_info=True,
             )
-
-    def _maybe_quota_warn(self, rec: dict):
-        """If `quota_warn_enabled` and the SMS sender matches
-        `quota_warn_sender`, parse the body against `quota_warn_pattern`
-        (with `x` as the integer placeholder, the rest matched as a
-        regex-escaped literal) and enqueue a quota-low warning when the
-        parsed MB is below `quota_warn_below_mb`. Logs every step so a
-        broken pattern is debuggable from the log alone."""
-        if not self.cfg.get("quota_warn_enabled", True):
-            return
-        want_sender = str(self.cfg.get("quota_warn_sender") or "").strip()
-        if not want_sender:
-            return
-        sender = str(rec.get("sender") or "").strip()
-        if sender != want_sender:
-            return
-        pattern = str(self.cfg.get("quota_warn_pattern") or "")
-        if "x" not in pattern:
-            self.logger.warning(
-                "quota: quota_warn_pattern has no 'x' placeholder, "
-                "skipping parse"
-            )
-            return
-        # Build regex: everything except the first `x` is a literal; the
-        # `x` becomes a digit-capture. Keeping it to the first `x` avoids
-        # surprises if the pattern legitimately contains other `x`s.
-        before, after = pattern.split("x", 1)
-        regex = re.escape(before) + r"(\d+)" + re.escape(after)
-        body = str(rec.get("body") or "")
-        m = re.search(regex, body)
-        if not m:
-            self.logger.info(
-                f"quota: sender match but pattern did not match body "
-                f"(pattern={pattern!r})"
-            )
-            return
-        try:
-            mb = int(m.group(1))
-        except (ValueError, IndexError):
-            self.logger.warning(
-                f"quota: matched but could not parse int from "
-                f"{m.group(0)!r}"
-            )
-            return
-        threshold = int(self.cfg.get("quota_warn_below_mb", 5000))
-        self.logger.info(
-            f"quota: parsed {mb} MB from sender={sender} "
-            f"(threshold={threshold} MB)"
-        )
-        # File log is independent of the threshold — captures every
-        # parsed quota value so a history is built up. The popup gate
-        # below still uses the threshold.
-        self._log_quota_line(rec, mb)
-        if mb >= threshold:
-            return
-        if self.quota_warner is None:
-            self.logger.warning(
-                "quota: below threshold but no warner is wired up"
-            )
-            return
-        self.quota_warner.enqueue(mb)
 
     def cycle(self):
         records = self.modem.list_sms()
@@ -964,7 +893,12 @@ class Fetcher:
                 continue
             sender = rec["sender"]
             blocked = bool(self.blacklist and self.blacklist.contains(sender))
-            target_dir = self.del_dir if blocked else self.sms_dir
+            is_otp = self._is_mci_otp(rec)
+            # OTP SMSes go straight to sms_del/ — they should never
+            # bother the user with a popup. The MciWatcher receives
+            # the code via the _maybe_dispatch_otp callback below, not
+            # by scanning the folders.
+            target_dir = self.del_dir if (blocked or is_otp) else self.sms_dir
             try:
                 path = save_sms(rec, target_dir, self.cfg["modem_url"])
             except Exception as e:
@@ -972,7 +906,14 @@ class Fetcher:
                     f"save failed: index={idx} sender={sender}: {e}"
                 )
                 continue
-            if blocked:
+            if is_otp:
+                self.logger.info(
+                    f"OTP-MCI index={idx} sender={sender} "
+                    f"received_at='{rec['received_at']}' -> "
+                    f"{target_dir.name}/{path.name} (routed silently)"
+                )
+                self._maybe_dispatch_otp(rec)
+            elif blocked:
                 self.logger.info(
                     f"BLOCKED index={idx} sender={sender} "
                     f"received_at='{rec['received_at']}' -> "
@@ -984,10 +925,6 @@ class Fetcher:
                     f"received_at='{rec['received_at']}' -> {path.name}"
                 )
                 self._maybe_forward(rec, path)
-            # Quota check is independent of the blacklist — even if the
-            # user has muted HAMRAHAVAL's regular notifications, the
-            # quota-low warning still fires.
-            self._maybe_quota_warn(rec)
             new_count += 1
             if not self.cfg.get("delete_after_save", True):
                 continue
@@ -2539,328 +2476,28 @@ class TelinaWatcher:
         self._save_state(calls)
 
 
-# ---------- daily USSD trigger ----------
-
-class UssdWatcher:
-    """Once-per-day USSD trigger: ``*10*327#`` → reply ``0`` → cancel,
-    via the modem panel's /boafrm/formUSSDSetup form. The operator
-    requires this periodic ping to keep the unlimited-data add-on
-    (``اشتراک پرو``) active.
-
-    User confirmation: the flow disconnects the LTE link briefly while
-    the modem talks to the network, so we don't fire silently — a Tk
-    modal pops up first with Snooze / Go ahead / Cancel and a 30-second
-    countdown that auto-clicks Go ahead if the user is away. See
-    `show_ussd_confirm_modal`.
-
-    Day tracking: ``last_run_date`` is persisted in
-    ``ussd_state_file``. When today's local date differs we are due;
-    Go-ahead success OR Cancel writes today's date so we won't fire
-    again until tomorrow. Failures leave it unwritten so the next tick
-    re-asks — but a 1-hour cooldown is applied first to avoid spamming
-    the user when the modem stays uncooperative. Snooze is in-memory
-    only (a restart re-evaluates from the persisted date alone).
-
-    The modal is deferred while Windows is in DND / Focus Assist /
-    fullscreen, the same as the SMS popups."""
-
-    USSD_CODE = "*10*327#"
-    USSD_PICK = "0"
-    # Substring that proves the operator menu we expected was returned.
-    # Full menu: "اشتراک پرو\n0.استعلام\n1.وصل\n2.قطع\n3.خرید اشتراک\n…".
-    MENU_EXPECTED = "اشتراک پرو"
-    # Substring that proves the '0' reply was processed.
-    # Full reply: "مشترک گرامی درخواست شما بررسی و نتیجه از طریق پیامک …".
-    RESULT_EXPECTED = "درخواست شما"
-
-    TICK_SECONDS = 60
-    FAILURE_COOLDOWN_SECONDS = 3600
-
-    _STATUS_RE = re.compile(r"var\s+ussdStatus\s*=\s*'(\d+)'")
-    _MENU_DIV_RE = re.compile(
-        r'<div id="ussd_menu_id">(.*?)</div>', re.DOTALL,
-    )
-
-    def __init__(self, cfg: dict, logger: logging.Logger,
-                 modem: ModemClient, ui_queue: "queue.Queue",
-                 on_state_change=None):
-        self.cfg = cfg
-        self.logger = logger
-        self.modem = modem
-        self.ui_queue = ui_queue
-        # Optional callback fired with True when the flow starts and
-        # False when it ends — main() uses this to flip the tray icon
-        # to its USSD-running colour.
-        self._on_state_change = on_state_change
-        self.state_path = app_dir() / cfg["ussd_state_file"]
-        self._stop = threading.Event()
-        self._wake = threading.Event()
-        # In-memory only — both reset on restart.
-        self._snooze_until: "float | None" = None
-        self._failure_until: "float | None" = None
-        self._modal_lock = threading.Lock()
-        self._modal_pending = False
-        # Single-flight guard so a manual tray trigger can't pile on
-        # top of an in-progress modal-Go flow (or vice versa).
-        self._flow_lock = threading.Lock()
-        self._flow_in_progress = False
-
-    def stop(self):
-        self._stop.set()
-        self._wake.set()
-
-    def trigger_now_force(self):
-        """Manual fire from the tray menu. Ignores today's `last_run_date`,
-        the DND state, snooze and the failure cooldown — runs the flow
-        immediately. On success, today is still marked done so the
-        scheduled daily modal won't fire again. No-op if a flow is
-        already running."""
-        with self._flow_lock:
-            if self._flow_in_progress:
-                self.logger.info(
-                    "ussd: manual trigger ignored — a flow is already running"
-                )
-                return
-            self._flow_in_progress = True
-        self.logger.info("ussd: manual trigger — running flow")
-        threading.Thread(
-            target=self._do_flow, daemon=True, name="ussd-manual",
-            args=("manual",),
-        ).start()
-
-    def _set_running(self, on: bool):
-        if self._on_state_change is not None:
-            try:
-                self._on_state_change(on)
-            except Exception as e:
-                self.logger.error(f"ussd: state-change cb error: {e}")
-
-    # ---- state ----
-
-    def _today(self) -> str:
-        return datetime.now().strftime("%Y-%m-%d")
-
-    def _load_last_run_date(self) -> "str | None":
-        if not self.state_path.exists():
-            return None
-        try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
-            d = data.get("last_run_date")
-            return str(d) if d else None
-        except Exception as e:
-            self.logger.error(f"ussd state load failed: {e}")
-            return None
-
-    def _save_done_today(self):
-        try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps({"last_run_date": self._today()}, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(self.state_path)
-        except Exception as e:
-            self.logger.error(f"ussd state save failed: {e}")
-
-    # ---- response parsing ----
-
-    @classmethod
-    def _ussd_status(cls, html_body: str) -> "str | None":
-        m = cls._STATUS_RE.search(html_body)
-        return m.group(1) if m else None
-
-    @classmethod
-    def _menu_text(cls, html_body: str) -> str:
-        m = cls._MENU_DIV_RE.search(html_body)
-        if not m:
-            return ""
-        # Strip tags, normalise whitespace. <br> separators in the
-        # network text become spaces — fine for a substring check.
-        inner = re.sub(r"<[^>]+>", " ", m.group(1))
-        return re.sub(r"\s+", " ", inner).strip()
-
-    # ---- modal dispatch ----
-
-    def _show_modal(self):
-        with self._modal_lock:
-            if self._modal_pending:
-                return
-            self._modal_pending = True
-        self.ui_queue.put(
-            ("ussd_confirm", {"on_result": self._on_modal_result})
-        )
-        self.logger.info("ussd: confirmation modal queued")
-
-    def _on_modal_result(self, action: str, snooze_minutes: int = 0):
-        """Tk-thread callback fired exactly once when the modal closes."""
-        with self._modal_lock:
-            self._modal_pending = False
-        if action == "go":
-            with self._flow_lock:
-                if self._flow_in_progress:
-                    self.logger.info(
-                        "ussd: modal Go ignored — a flow is already running"
-                    )
-                    return
-                self._flow_in_progress = True
-            # Run on a worker thread so the Tk main loop stays responsive
-            # during the modem round-trips (~5–10 s).
-            threading.Thread(
-                target=self._do_flow, daemon=True, name="ussd-flow",
-                args=("daily",),
-            ).start()
-        elif action == "snooze":
-            self._snooze_until = time.monotonic() + snooze_minutes * 60
-            self.logger.info(f"ussd: snoozed for {snooze_minutes} min")
-            self._wake.set()
-        elif action == "cancel":
-            self._save_done_today()
-            self.logger.info("ussd: cancelled — marked done for today")
-            self._wake.set()
-
-    # ---- flow ----
-
-    def _do_flow(self, label: str):
-        """Worker-thread entry for both the modal Go-ahead and the
-        manual tray trigger. Caller must have set `_flow_in_progress`
-        to True under `_flow_lock`; this method clears it on exit and
-        signals the icon-state callback for the duration of the run."""
-        self._set_running(True)
-        try:
-            ok = self._run_flow()
-            if ok:
-                self._save_done_today()
-                self.logger.info(
-                    f"ussd: {label} flow ok, marked done for today"
-                )
-            else:
-                self._failure_until = (
-                    time.monotonic() + self.FAILURE_COOLDOWN_SECONDS
-                )
-                self.logger.warning(
-                    f"ussd: {label} flow failed; cooldown "
-                    f"{self.FAILURE_COOLDOWN_SECONDS // 60} min before retry"
-                )
-        finally:
-            self._set_running(False)
-            with self._flow_lock:
-                self._flow_in_progress = False
-            self._wake.set()
-
-    def _run_flow(self) -> bool:
-        # Defensive pre-cancel — if a previous session is still hanging
-        # on the modem (e.g. a panel left open in a browser tab), this
-        # clears it so our menu probe lands cleanly.
-        try:
-            self.modem.ussd_post(status_input="menu", cancel="1")
-        except Exception as e:
-            self.logger.warning(f"ussd: pre-reset failed (continuing): {e}")
-        try:
-            html_body = self.modem.ussd_post(
-                ussd_value=self.USSD_CODE, status_input="ussd", cancel="0",
-            )
-            menu = self._menu_text(html_body)
-            self.logger.info(
-                f"ussd: sent {self.USSD_CODE}, "
-                f"status={self._ussd_status(html_body)}, "
-                f"menu={menu[:160]!r}"
-            )
-            if self.MENU_EXPECTED not in menu:
-                self.logger.error(
-                    f"ussd: expected menu substring "
-                    f"{self.MENU_EXPECTED!r} not found"
-                )
-                self._safe_cancel()
-                return False
-
-            html_body = self.modem.ussd_post(
-                select_menu=self.USSD_PICK, status_input="menu", cancel="0",
-            )
-            result = self._menu_text(html_body)
-            self.logger.info(
-                f"ussd: sent pick={self.USSD_PICK!r}, "
-                f"status={self._ussd_status(html_body)}, "
-                f"result={result[:240]!r}"
-            )
-            if self.RESULT_EXPECTED not in result:
-                self.logger.error(
-                    f"ussd: expected result substring "
-                    f"{self.RESULT_EXPECTED!r} not found"
-                )
-                self._safe_cancel()
-                return False
-
-            self._safe_cancel()
-            return True
-        except Exception as e:
-            self.logger.error(f"ussd: flow error: {e}", exc_info=True)
-            self._safe_cancel()
-            return False
-
-    def _safe_cancel(self):
-        try:
-            self.modem.ussd_post(status_input="menu", cancel="1")
-            self.logger.info("ussd: session cancelled")
-        except Exception as e:
-            self.logger.warning(f"ussd: cancel failed: {e}")
-
-    # ---- tick ----
-
-    def tick(self):
-        with self._modal_lock:
-            if self._modal_pending:
-                return
-        if self._load_last_run_date() == self._today():
-            return
-        if not accepts_notifications():
-            return
-        now = time.monotonic()
-        if self._snooze_until is not None:
-            if now < self._snooze_until:
-                return
-            self._snooze_until = None
-        if self._failure_until is not None:
-            if now < self._failure_until:
-                return
-            self._failure_until = None
-        self._show_modal()
-
-    def run(self):
-        # Brief startup grace so the rest of the app fully initialises
-        # (and the tray icon is up) before we possibly pop the modal.
-        if self._stop.wait(15):
-            return
-        while not self._stop.is_set():
-            try:
-                self.tick()
-            except Exception as e:
-                self.logger.error(f"ussd: tick error: {e}", exc_info=True)
-            self._wake.clear()
-            self._wake.wait(self.TICK_SECONDS)
-
-
 # ---------- quota-low warning ----------
 
 class QuotaWarner:
     """Drains a FIFO of quota-low warnings into bottom-right Tk popups,
     one at a time, only while Windows accepts notifications. The
-    Fetcher calls `enqueue(mb)` when it parses a low-quota SMS; the
-    popup may appear seconds or hours later, depending on DND state.
+    MciWatcher calls `enqueue(gb)` after each panel scrape that reads
+    a remaining quota below the configured threshold; the popup may
+    appear seconds or hours later, depending on DND state.
 
     Why a separate thread instead of dispatching the popup straight
-    from the Fetcher: SMS receipt happens during the Fetcher's modem
-    poll, but the popup needs to defer under DND/Focus Assist/
-    fullscreen (same as the SMS toast popups). Keeping the queue here
-    decouples those two concerns and means a backlog of warnings
-    drains cleanly when the user comes out of DND."""
+    from the watcher: panel scrapes happen on a fixed interval, but
+    the popup needs to defer under DND/Focus Assist/fullscreen (same
+    as the SMS toast popups). Keeping the queue here decouples those
+    two concerns and means a backlog of warnings drains cleanly when
+    the user comes out of DND."""
 
     TICK_SECONDS = 15
 
     def __init__(self, ui_queue: "queue.Queue", logger: logging.Logger):
         self.ui_queue = ui_queue
         self.logger = logger
-        self._pending: "list[int]" = []
+        self._pending: "list[float]" = []
         self._lock = threading.Lock()
         self._showing = False
         self._stop = threading.Event()
@@ -2870,14 +2507,13 @@ class QuotaWarner:
         self._stop.set()
         self._wake.set()
 
-    def enqueue(self, mb: int):
-        """Called from the Fetcher thread when a low-quota SMS arrives.
-        The user asked for the warning to fire **every** receipt, so we
-        don't dedupe — each call queues a fresh popup."""
+    def enqueue(self, gb: float):
+        """Called from the MciWatcher thread after a low-quota scrape.
+        Each call queues a fresh popup — no dedupe."""
         with self._lock:
-            self._pending.append(int(mb))
+            self._pending.append(float(gb))
         self.logger.info(
-            f"quota: enqueued warning for {mb} MB "
+            f"quota: enqueued warning for {gb:.2f} GB "
             f"(pending={len(self._pending)})"
         )
         self._wake.set()
@@ -2896,12 +2532,12 @@ class QuotaWarner:
         if not accepts_notifications():
             return
         with self._lock:
-            mb = self._pending.pop(0)
+            gb = self._pending.pop(0)
             self._showing = True
         self.ui_queue.put(
-            ("show_quota_warning", {"mb": mb, "on_ack": self._on_ack})
+            ("show_quota_warning", {"gb": gb, "on_ack": self._on_ack})
         )
-        self.logger.info(f"quota: showing warning popup for {mb} MB")
+        self.logger.info(f"quota: showing warning popup for {gb:.2f} GB")
 
     def run(self):
         while not self._stop.is_set():
@@ -2915,24 +2551,587 @@ class QuotaWarner:
             self._wake.wait(self.TICK_SECONDS)
 
 
+# ---------- MCI panel watcher (auto-login + remaining-quota scrape) ----------
+
+# Hardcoded — these are MCI's own endpoints and not configurable. If MCI
+# rewires the panel, the constants here are the only place to update.
+MCI_API_BASE = "https://my.mci.ir"
+MCI_ENDPOINT_SEND_OTP = "/api/idm/v1/auth/send-otp"
+MCI_ENDPOINT_VERIFY_OTP = "/api/idm/v1/auth"
+MCI_ENDPOINT_QUOTA = "/api/unit/v1/packages/details"
+
+
+class MciClient:
+    """Client for https://my.mci.ir/panel — authenticates via SMS OTP
+    and reads the remaining-quota figure off the packages-details API.
+
+    Login flow (two JSON POSTs):
+      1. POST /api/idm/v1/auth/send-otp  body {"username": "<10-digit mobile>"}
+      2. POST /api/idm/v1/auth           body {"username": "<mobile>",
+                                              "credential": "<5-digit OTP>",
+                                              "credential_type": "OTP"}
+
+    Auth is **JWT Bearer**, confirmed by end-to-end test against the
+    live server. The verify response carries
+    `{"access_token": "<JWT>"}`; the only cookie set during the whole
+    flow is the CDN/WAF's `cookiesession1`, which doesn't authorize
+    the quota GET on its own. verify_otp() pulls the JWT out of the
+    body (checking `access_token` / `token` / `accessToken` / `id_token`
+    at the top level and one level deep under `data`) and adds it as
+    `Authorization: Bearer …`. Session state is persisted to
+    `mci_state.json` (cookies + bearer + extras + saved_at) and
+    replayed on restart, so the OTP flow only runs when the server
+    has expired the session remotely (401/403 on a quota GET).
+
+    The state file also carries arbitrary scalar "extras" written via
+    `set_extra(key, value)` — used by MciWatcher to persist
+    `last_check_date` alongside the auth material in the same file."""
+
+    BASE = MCI_API_BASE
+
+    # Browser-shaped headers so the panel's WAF / CDN doesn't classify
+    # us as a bot. Origin / Referer mimic the SPA itself. The MCI panel
+    # sits behind a TLS-fingerprinting WAF — Python `requests` (OpenSSL)
+    # passes, Windows' bundled curl (Schannel) gets 599-Blocked. See
+    # the README's "WAF — TLS fingerprinting" note.
+    _COMMON_HEADERS = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "fa,en;q=0.9",
+        "Content-Type": "application/json;charset=UTF-8",
+        "Origin": "https://my.mci.ir",
+        "Referer": "https://my.mci.ir/panel",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    def __init__(self, username: str, state_path: Path, timeout: float,
+                 logger: logging.Logger):
+        self.username = username
+        self.state_path = state_path
+        self.timeout = timeout
+        self.logger = logger
+        self.session = requests.Session()
+        # Same rationale as ModemClient: behind a system HTTP proxy the
+        # request could be hijacked. We always talk directly.
+        self.session.trust_env = False
+        self.session.headers.update(self._COMMON_HEADERS)
+        # Optional Bearer token, populated when verify_otp finds one in
+        # the JSON response body.
+        self._bearer: "str | None" = None
+        # Extra scalar fields persisted alongside cookies/bearer. The
+        # MciWatcher uses this to store `last_check_date`. Survives
+        # clear_session() — only cookies/bearer are cleared on session
+        # expiry; the "last successful quota check date" is a separate
+        # fact and shouldn't be reset just because auth lapsed.
+        self._extra: dict = {}
+        # Guards _extra + the state-file I/O. RLock so set_extra() can
+        # call _save_state_unlocked() without deadlocking.
+        self._state_lock = threading.RLock()
+        self._load_state()
+
+    # ---- state persistence ----
+
+    def _state_payload(self) -> dict:
+        cookies = []
+        for c in self.session.cookies:
+            cookies.append({
+                "name": c.name, "value": c.value,
+                "domain": c.domain, "path": c.path,
+                "expires": c.expires, "secure": c.secure,
+            })
+        payload = dict(self._extra)
+        payload.update({
+            "cookies": cookies,
+            "bearer": self._bearer,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        return payload
+
+    def _save_state_unlocked(self):
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    self._state_payload(),
+                    indent=2, ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(self.state_path)
+        except Exception as e:
+            self.logger.error(f"mci: save state failed: {e}")
+
+    def _save_state(self):
+        with self._state_lock:
+            self._save_state_unlocked()
+
+    def _load_state(self):
+        if not self.state_path.exists():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            for c in data.get("cookies") or []:
+                self.session.cookies.set(
+                    c["name"], c["value"],
+                    domain=c.get("domain") or None,
+                    path=c.get("path") or "/",
+                )
+            self._bearer = data.get("bearer") or None
+            if self._bearer:
+                self.session.headers["Authorization"] = (
+                    f"Bearer {self._bearer}"
+                )
+            # Anything that isn't a known auth field becomes an "extra".
+            reserved = {"cookies", "bearer", "saved_at"}
+            self._extra = {
+                k: v for k, v in data.items() if k not in reserved
+            }
+            self.logger.info(
+                f"mci: loaded session from {self.state_path.name} "
+                f"(cookies={len(data.get('cookies') or [])}, "
+                f"bearer={'yes' if self._bearer else 'no'}, "
+                f"extras={list(self._extra.keys()) or 'none'})"
+            )
+        except Exception as e:
+            self.logger.error(f"mci: load state failed: {e}")
+
+    def get_extra(self, key: str, default=None):
+        with self._state_lock:
+            return self._extra.get(key, default)
+
+    def set_extra(self, key: str, value):
+        """Persist an arbitrary scalar alongside the auth state. Writes
+        the whole state file atomically so cookies/bearer aren't lost."""
+        with self._state_lock:
+            self._extra[key] = value
+            self._save_state_unlocked()
+
+    def clear_session(self):
+        """Drop cookies/bearer (in memory) and persist the cleared
+        state. Called when the server returns 401/403 on a quota GET —
+        the watcher then re-runs the OTP flow. ``_extra`` is preserved:
+        `last_check_date` records "we last successfully read quota on
+        date X" and isn't invalidated by a session expiry."""
+        with self._state_lock:
+            self.session.cookies.clear()
+            self._bearer = None
+            self.session.headers.pop("Authorization", None)
+            self._save_state_unlocked()
+
+    # ---- HTTP calls ----
+
+    def request_otp(self):
+        """POST send-otp → MCI sends a 5-digit code SMS to the registered
+        SIM. Raises on non-2xx."""
+        url = self.BASE + MCI_ENDPOINT_SEND_OTP
+        r = self.session.post(
+            url, json={"username": self.username},
+            timeout=self.timeout,
+        )
+        if not r.ok:
+            preview = r.text[:200].replace("\n", " ")
+            raise RuntimeError(
+                f"mci: send-otp HTTP {r.status_code}: {preview!r}"
+            )
+        self.logger.info(f"mci: send-otp OK (HTTP {r.status_code})")
+
+    def verify_otp(self, code: str):
+        """POST verify with the OTP digits. Captures whatever auth
+        material the server returns: cookies (auto-handled by the
+        Session), and/or a Bearer token if one shows up in the JSON
+        body. Raises on non-2xx OR if no auth material was returned
+        (so we don't silently persist an unauthenticated session)."""
+        url = self.BASE + MCI_ENDPOINT_VERIFY_OTP
+        r = self.session.post(
+            url, json={
+                "username": self.username,
+                "credential": code,
+                "credential_type": "OTP",
+            },
+            timeout=self.timeout,
+        )
+        if not r.ok:
+            preview = r.text[:200].replace("\n", " ")
+            raise RuntimeError(
+                f"mci: verify-otp HTTP {r.status_code}: {preview!r}"
+            )
+        # Best-effort token extraction. We try a few common shapes
+        # because the actual response schema wasn't captured when this
+        # was written; whichever one matches wins, the others are
+        # harmless. If none match and there are cookies, that's fine —
+        # cookie auth alone is sufficient for the quota GET.
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+        token = None
+        candidates = ("access_token", "token", "accessToken", "id_token")
+        if isinstance(data, dict):
+            for key in candidates:
+                v = data.get(key)
+                if isinstance(v, str) and len(v) > 10:
+                    token = v
+                    break
+            if not token and isinstance(data.get("data"), dict):
+                inner = data["data"]
+                for key in candidates:
+                    v = inner.get(key)
+                    if isinstance(v, str) and len(v) > 10:
+                        token = v
+                        break
+        if token:
+            self._bearer = token
+            self.session.headers["Authorization"] = f"Bearer {token}"
+        n_cookies = len(self.session.cookies)
+        self.logger.info(
+            f"mci: verify-otp OK (HTTP {r.status_code}, "
+            f"cookies={n_cookies}, bearer={'yes' if token else 'no'})"
+        )
+        if not token and n_cookies == 0:
+            raise RuntimeError(
+                "mci: verify-otp returned no cookies and no token; "
+                f"response preview: {r.text[:200]!r}"
+            )
+        self._save_state()
+
+    def fetch_quota(self) -> dict:
+        """GET packages-details. Returns
+        {"unused_gb": float, "unit": str, "raw": dict}.
+        Raises PermissionError on 401/403 so the watcher knows to
+        re-run the OTP flow; raises RuntimeError on other failures."""
+        url = self.BASE + MCI_ENDPOINT_QUOTA
+        r = self.session.get(url, timeout=self.timeout)
+        if r.status_code in (401, 403):
+            raise PermissionError(
+                f"mci: quota HTTP {r.status_code} (session expired)"
+            )
+        if not r.ok:
+            preview = r.text[:200].replace("\n", " ")
+            raise RuntimeError(
+                f"mci: quota HTTP {r.status_code}: {preview!r}"
+            )
+        try:
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"mci: quota response not JSON: {e}")
+        unused = data.get("totalUnusedBytes")
+        unit = (
+            data.get("bytesUnusedUnit")
+            or data.get("bytesUnit")
+            or "گیگ"
+        )
+        if unused is None:
+            raise RuntimeError(
+                "mci: quota response missing totalUnusedBytes; "
+                f"preview: {json.dumps(data, ensure_ascii=False)[:200]}"
+            )
+        try:
+            gb = float(unused)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"mci: totalUnusedBytes not numeric: {unused!r}"
+            )
+        return {"unused_gb": gb, "unit": str(unit), "raw": data}
+
+
+class MciWatcher:
+    """Reads the MCI panel's remaining-quota figure once per local
+    calendar day (auto trigger) or on demand from the tray menu. Auth
+    is JWT Bearer, refreshed via SMS-OTP whenever the server returns
+    401/403.
+
+    The flow is **asynchronous**, decoupling "I need quota" from "OTP
+    arrived":
+
+    1. ``tick()`` checks today's date against ``last_check_date``
+       (persisted in mci_state.json). If today is already done and the
+       caller isn't forcing, no-op. Otherwise call ``fetch_quota``:
+
+         - HTTP 200 → success path (log reading, threshold-check, mark
+           today done).
+         - HTTP 401/403 → clear cookies/bearer, set the in-memory
+           ``_pending_quota_check`` flag, POST send-otp (subject to a
+           per-OTP cooldown), and **return immediately**. No
+           synchronous wait for the SMS — the loop is free for other
+           work.
+         - Any other error → log, return (no state change, retry next
+           tick).
+
+    2. ``on_otp_received(code)`` is called from the Fetcher thread
+       whenever an SMS matching ``mci_otp_match_substring`` is saved
+       (this includes OTPs we triggered AND spontaneous ones from the
+       user logging in to mci.ir's website themselves). We POST
+       verify with the digits; on success:
+
+         - If ``_pending_quota_check`` was set, run the deferred
+           ``fetch_quota`` now and mark today done.
+         - Otherwise just log "session refreshed opportunistically" —
+           the user's manual browser login left us with fresh auth for
+           the next scheduled check.
+
+       If verify fails (e.g. the OTP was already consumed by the
+       user's browser before we got there), the failure is logged and
+       the session state is left as-is.
+
+    3. ``trigger_now()`` (tray menu's *Check MCI quota*) sets the
+       ``_force_run`` flag and wakes the loop, so the next ``tick()``
+       re-runs even if today is already done.
+
+    Cooldown: after a successful send-otp, the watcher won't re-send
+    for ``mci_otp_wait_seconds`` (default 120 s). Prevents OTP-burning
+    when an SMS gets stuck in transit and the daily tick comes around
+    again. Reset to zero on successful verify.
+
+    State persisted to ``mci_state.json``: cookies (a CDN cookie only,
+    not auth), bearer (the JWT), ``last_check_date`` (YYYY-MM-DD).
+    The in-memory pending-check flag and cooldown timestamp don't
+    survive a restart — after a restart the next tick will try
+    fetch_quota afresh and re-enter the OTP flow if needed.
+
+    Skipped entirely when ``mci_enabled`` is false. Errors inside
+    tick() and on_otp_received() are caught and logged, so a broken
+    MCI path never affects the Fetcher / Notifier / Relayer /
+    UsageTracker / Telina threads."""
+
+    # Lets the rest of the app initialise before the first possible
+    # tick (especially the Fetcher, which may already have an unread
+    # OTP SMS from a previous run sitting in sms/).
+    STARTUP_GRACE_SECONDS = 20
+
+    def __init__(self, cfg: dict, logger: logging.Logger,
+                 quota_warner: "QuotaWarner | None"):
+        self.cfg = cfg
+        self.logger = logger
+        self.quota_warner = quota_warner
+        self.app = app_dir()
+        self.quota_log_path = (
+            self.app / cfg["usage_total_folder"]
+            / cfg["mci_quota_log_filename"]
+        )
+        self.threshold_gb = float(cfg.get("mci_quota_below_gb", 5.0))
+        self.otp_wait_s = int(cfg.get("mci_otp_wait_seconds", 120))
+        self.client = MciClient(
+            username=str(cfg["mci_username"]),
+            state_path=self.app / cfg["mci_state_file"],
+            timeout=float(cfg.get("request_timeout_seconds", 15)),
+            logger=logger,
+        )
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        # Serialises tick() against on_otp_received(). Both call into
+        # the client (which itself shares one requests.Session), so a
+        # second concurrent call could leak partial state. RLock so a
+        # nested re-entry from within the same thread is safe.
+        self._client_lock = threading.RLock()
+        # In-memory state — does NOT survive restart, which is fine.
+        # If the app dies while waiting for an OTP, the next start will
+        # try fetch_quota again, get 401, and start a fresh OTP cycle.
+        self._pending_quota_check = False
+        self._last_otp_sent_at: "float | None" = None
+        self._force_run = False
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def trigger_now(self):
+        """Tray-menu manual fire — re-run the tick now even if today's
+        already done."""
+        self._force_run = True
+        self._wake.set()
+
+    def run(self):
+        if self._stop.wait(self.STARTUP_GRACE_SECONDS):
+            return
+        while not self._stop.is_set():
+            # Clear before the tick so a trigger_now() during the tick
+            # is captured by the subsequent wait (causing an immediate
+            # next tick). Same pattern as Fetcher.run().
+            self._wake.clear()
+            try:
+                self.tick()
+            except Exception as e:
+                self.logger.error(f"mci: tick error: {e}", exc_info=True)
+            self._wake.wait(float(self.cfg["mci_interval_seconds"]))
+
+    # ---- date tracking ----
+
+    @staticmethod
+    def _today_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _last_check_date(self) -> "str | None":
+        v = self.client.get_extra("last_check_date")
+        return str(v) if v else None
+
+    def _mark_today_done(self):
+        self.client.set_extra("last_check_date", self._today_str())
+
+    # ---- tick (auto or tray-triggered) ----
+
+    def tick(self):
+        with self._client_lock:
+            force = self._force_run
+            self._force_run = False
+            today = self._today_str()
+            last = self._last_check_date()
+            if not force and last == today:
+                return
+            if force:
+                self.logger.info("mci: force-triggered tick")
+            else:
+                self.logger.info(
+                    f"mci: daily tick (today={today}, last_check_date={last})"
+                )
+            self._try_fetch_or_request_otp()
+
+    def _try_fetch_or_request_otp(self):
+        """Caller must hold ``_client_lock``."""
+        try:
+            result = self.client.fetch_quota()
+        except PermissionError as e:
+            self.logger.info(f"{e}")
+            self.client.clear_session()
+            self._pending_quota_check = True
+            self._maybe_request_otp()
+            return
+        except Exception as e:
+            self.logger.error(f"mci: fetch_quota error: {e}")
+            return
+        self._on_quota_success(result)
+
+    def _maybe_request_otp(self):
+        """POST send-otp unless we're inside the cooldown window. Caller
+        must hold ``_client_lock``."""
+        now = time.monotonic()
+        if self._last_otp_sent_at is not None:
+            elapsed = now - self._last_otp_sent_at
+            if elapsed < self.otp_wait_s:
+                left = int(self.otp_wait_s - elapsed)
+                self.logger.info(
+                    f"mci: OTP cooldown active ({left} s left); "
+                    "not re-sending"
+                )
+                return
+        try:
+            self.client.request_otp()
+            self._last_otp_sent_at = now
+            self.logger.info(
+                "mci: send-otp dispatched; awaiting SMS receipt "
+                "(Fetcher will call on_otp_received when it lands)"
+            )
+        except Exception as e:
+            self.logger.error(f"mci: request_otp failed: {e}")
+
+    # ---- OTP callback from the Fetcher ----
+
+    def on_otp_received(self, code: str):
+        """Called from the Fetcher thread when an SMS matching the
+        configured ``mci_otp_match_substring`` is saved. Verifies the
+        code with MCI; if a quota check is pending (we triggered
+        send-otp earlier), runs the deferred fetch_quota now and marks
+        today done. Otherwise (spontaneous OTP from user's own browser
+        login) just refreshes our session.
+
+        Race-safe against tick() via ``_client_lock``: never two
+        concurrent calls into ``self.client``."""
+        if not code:
+            return
+        with self._client_lock:
+            self.logger.info(
+                f"mci: OTP received (len={len(code)}); verifying"
+            )
+            try:
+                self.client.verify_otp(code)
+            except Exception as e:
+                self.logger.warning(
+                    f"mci: verify_otp failed: {e} "
+                    "(may have been consumed elsewhere — fine)"
+                )
+                return
+            # Successful verify ends the auth cycle, so any subsequent
+            # 401 should be allowed to request OTP again without waiting
+            # for the previous cooldown to elapse.
+            self._last_otp_sent_at = None
+            if not self._pending_quota_check:
+                self.logger.info(
+                    "mci: session refreshed opportunistically "
+                    "(no quota check was pending)"
+                )
+                return
+            self._pending_quota_check = False
+            try:
+                result = self.client.fetch_quota()
+            except Exception as e:
+                self.logger.error(
+                    f"mci: deferred fetch_quota after verify failed: {e}"
+                )
+                return
+            self._on_quota_success(result)
+
+    # ---- success path ----
+
+    def _on_quota_success(self, result: dict):
+        gb = result["unused_gb"]
+        unit = result["unit"]
+        self.logger.info(f"mci: remaining quota = {gb:.2f} {unit}")
+        self._log_quota_line(gb)
+        self._mark_today_done()
+        if gb < self.threshold_gb:
+            if self.quota_warner is not None:
+                self.quota_warner.enqueue(gb)
+            else:
+                self.logger.warning(
+                    f"mci: {gb:.2f} GB < threshold {self.threshold_gb} GB "
+                    "but no quota_warner is wired up"
+                )
+
+    # ---- file log ----
+
+    def _log_quota_line(self, gb: float):
+        """Insert or overwrite (keyed by timestamp prefix) one
+        `ts  gb GB` line in the per-app quota log."""
+        ts = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+        value = f"{gb:.2f} GB"
+        try:
+            self.quota_log_path.parent.mkdir(parents=True, exist_ok=True)
+            lines: list[str] = []
+            if self.quota_log_path.exists():
+                for raw in self.quota_log_path.read_text(
+                    encoding="utf-8"
+                ).splitlines():
+                    if not raw.strip():
+                        continue
+                    if raw.startswith(ts + " "):
+                        continue
+                    lines.append(raw)
+            lines.append(f"{ts}  {value}")
+            lines.sort()
+            tmp = self.quota_log_path.with_suffix(".txt.tmp")
+            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tmp.replace(self.quota_log_path)
+        except Exception as e:
+            self.logger.error(
+                f"mci: write {self.quota_log_path.name} failed: {e}"
+            )
+
+
 # ---------- tray icon image ----------
 
-def make_icon_image(unread: int = 0, relaying: bool = False,
-                    ussd_running: bool = False) -> Image.Image:
-    """Black 'S' on a filled circle, transparent background. Four states:
-    orange while the daily USSD trigger is mid-flight (the LTE link
-    drops briefly while the modem talks to the network), yellow while
-    a relay (FTP upload + outbound SMS) is in flight, red while toasts
-    are awaiting acknowledgement, green when idle. Orange wins over
-    yellow because USSD is the more user-impactful event; yellow wins
-    over red because it is transient and meaningful (the user is
-    actively being forwarded an SMS via the modem)."""
+def make_icon_image(unread: int = 0, relaying: bool = False) -> Image.Image:
+    """Black 'S' on a filled circle, transparent background. Three
+    states: yellow while a relay (FTP upload + outbound SMS) is in
+    flight, red while toasts are awaiting acknowledgement, green when
+    idle. Yellow wins over red because it is transient and meaningful
+    (the user is actively being forwarded an SMS via the modem)."""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    if ussd_running:
-        circle_fill = (255, 140, 0, 255)
-    elif relaying:
+    if relaying:
         circle_fill = (240, 200, 0, 255)
     elif unread > 0:
         circle_fill = (210, 30, 30, 255)
@@ -3128,9 +3327,9 @@ def show_toast_popup(parent: tk.Tk, sender: str, body: str, on_ack):
 POPUP_ACCENT_WARN = "#e07a3a"  # orange
 
 
-def show_quota_warning_popup(parent: tk.Tk, mb: int, on_ack):
-    """Bottom-right Tk warning popup with the parsed remaining quota
-    (MB). Stacks alongside SMS toasts via the same TOAST_SLOTS, with
+def show_quota_warning_popup(parent: tk.Tk, gb: float, on_ack):
+    """Bottom-right Tk warning popup with the scraped remaining quota
+    (GB). Stacks alongside SMS toasts via the same TOAST_SLOTS, with
     an orange accent bar instead of blue to flag it as a warning.
     on_ack() is called exactly once when the popup is dismissed."""
     slot = TOAST_SLOTS.claim()
@@ -3190,7 +3389,7 @@ def show_quota_warning_popup(parent: tk.Tk, mb: int, on_ack):
     ).pack(side="right")
 
     tk.Label(
-        inner, text=f"Internet quota is low: {mb} MB remaining.",
+        inner, text=f"Internet quota is low: {gb:.2f} GB remaining.",
         bg=POPUP_BG, fg=POPUP_FG,
         font=("Tahoma", 10),
         wraplength=POPUP_W - 30, justify="left", anchor="nw",
@@ -3259,125 +3458,6 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
     txt.focus_set()
 
 
-def show_ussd_confirm_modal(parent: tk.Tk, on_result):
-    """Confirmation modal before the daily USSD trigger fires. Calls
-    `on_result(action, snooze_minutes)` exactly once with action in
-    {"go", "snooze", "cancel"}; snooze_minutes is meaningful only when
-    action == "snooze".
-
-    A 30-second countdown auto-clicks Go ahead if the user does
-    nothing — the daily trigger should not be silently blocked by a
-    forgotten modal."""
-    snooze_options = [
-        ("10min", 10),
-        ("30min", 30),
-        ("1 hour", 60),
-        ("2 hours", 120),
-        ("3 hours", 180),
-    ]
-    countdown_seconds = 30
-
-    win = tk.Toplevel(parent)
-    win.title(f"{APP_NAME} - Send USSD?")
-    win.attributes("-topmost", True)
-    win.resizable(False, False)
-
-    state = {"closed": False, "remaining": countdown_seconds}
-
-    def _close(action: str, snooze_min: int = 0):
-        if state["closed"]:
-            return
-        state["closed"] = True
-        try:
-            win.destroy()
-        except Exception:
-            pass
-        try:
-            on_result(action, snooze_min)
-        except Exception:
-            pass
-
-    body = tk.Frame(win, padx=16, pady=14)
-    body.pack(fill="both", expand=True)
-
-    tk.Label(
-        body,
-        text=("Ready to send USSD code?\n"
-              "Internet will be disconnected for a while."),
-        justify="left", anchor="w", font=("Segoe UI", 10),
-    ).pack(fill="x", pady=(0, 12))
-
-    snooze_row = tk.Frame(body)
-    snooze_row.pack(fill="x", pady=(0, 14))
-    tk.Label(
-        snooze_row, text="Snooze time: ", font=("Segoe UI", 10),
-    ).pack(side="left")
-    snooze_var = tk.StringVar(value=snooze_options[0][0])
-    combo = ttk.Combobox(
-        snooze_row, textvariable=snooze_var,
-        values=[lbl for lbl, _ in snooze_options],
-        state="readonly", width=10,
-    )
-    combo.pack(side="left")
-
-    btns = tk.Frame(body)
-    btns.pack(fill="x")
-
-    def _on_cancel():
-        _close("cancel")
-
-    def _on_snooze():
-        sel = snooze_var.get()
-        mins = next((m for lbl, m in snooze_options if lbl == sel),
-                    snooze_options[0][1])
-        _close("snooze", mins)
-
-    def _on_go():
-        _close("go")
-
-    cancel_btn = tk.Button(btns, text="Cancel", width=12, command=_on_cancel)
-    cancel_btn.pack(side="left")
-    snooze_btn = tk.Button(btns, text="Snooze", width=12, command=_on_snooze)
-    snooze_btn.pack(side="left", padx=(8, 0))
-    go_btn = tk.Button(
-        btns, text=f"Go ahead! ({countdown_seconds})",
-        width=18, command=_on_go,
-    )
-    go_btn.pack(side="right")
-
-    def _tick():
-        if state["closed"]:
-            return
-        state["remaining"] -= 1
-        if state["remaining"] <= 0:
-            _close("go")
-            return
-        try:
-            go_btn.config(text=f"Go ahead! ({state['remaining']})")
-        except Exception:
-            return
-        win.after(1000, _tick)
-
-    win.after(1000, _tick)
-    win.protocol("WM_DELETE_WINDOW", _on_cancel)
-    win.bind("<Escape>", lambda _e: _on_cancel())
-
-    # Centre roughly on the primary screen.
-    win.update_idletasks()
-    w = max(win.winfo_width(), 380)
-    h = max(win.winfo_height(), 140)
-    sw = win.winfo_screenwidth()
-    sh = win.winfo_screenheight()
-    x = (sw - w) // 2
-    y = (sh - h) // 3
-    win.geometry(f"{w}x{h}+{x}+{y}")
-
-    win.lift()
-    win.focus_force()
-    go_btn.focus_set()
-    win.after(300, lambda: win.attributes("-topmost", False))
-
-
 # ---------- main ----------
 
 def _ensure_dirs(cfg: dict, logger: "logging.Logger | None" = None):
@@ -3441,20 +3521,18 @@ def main() -> int:
 
     blacklist = Blacklist(app_dir() / cfg["blacklist_file"], logger)
 
-    # Quota-low warner — must be wired into the Fetcher BEFORE its
-    # thread starts so the first incoming SMS can already enqueue.
+    # Quota-low warner — fed by MciWatcher when a scrape returns below
+    # threshold. Started only when MCI is enabled, since it's the sole
+    # producer.
     quota_warner: "QuotaWarner | None" = None
-    if cfg.get("quota_warn_enabled", True):
+    if cfg.get("mci_enabled", True):
         quota_warner = QuotaWarner(ui_queue, logger)
         quota_thread = threading.Thread(target=quota_warner.run, daemon=True)
         quota_thread.start()
         logger.info("quota: warner thread started")
-    else:
-        logger.info("quota: disabled in config")
 
     fetcher = Fetcher(cfg, logger)
     fetcher.blacklist = blacklist
-    fetcher.quota_warner = quota_warner
     fetcher_thread = threading.Thread(target=fetcher.run, daemon=True)
     fetcher_thread.start()
 
@@ -3465,31 +3543,23 @@ def main() -> int:
     usage_thread.start()
 
     icon_holder = {"icon": None}
-    icon_state = {"unread": 0, "relaying": False, "ussd_running": False}
+    icon_state = {"unread": 0, "relaying": False}
     icon_state_lock = threading.Lock()
 
     def _refresh_icon():
-        # Orange (USSD running) wins over yellow (relaying) wins over
-        # red (unread) wins over green (idle). pystray supports updating
-        # icon.icon and icon.title from any thread, but bouncing through
-        # one helper keeps the state machine in one place.
+        # Yellow (relaying) wins over red (unread) wins over green
+        # (idle). pystray supports updating icon.icon and icon.title
+        # from any thread, but bouncing through one helper keeps the
+        # state machine in one place.
         icon = icon_holder.get("icon")
         if icon is None:
             return
         with icon_state_lock:
             unread = icon_state["unread"]
             relaying = icon_state["relaying"]
-            ussd_running = icon_state["ussd_running"]
         try:
-            icon.icon = make_icon_image(
-                unread=unread, relaying=relaying, ussd_running=ussd_running,
-            )
-            if ussd_running:
-                icon.title = (
-                    f"{APP_NAME} (running USSD, {unread} unread)" if unread
-                    else f"{APP_NAME} (running USSD)"
-                )
-            elif relaying:
+            icon.icon = make_icon_image(unread=unread, relaying=relaying)
+            if relaying:
                 icon.title = (
                     f"{APP_NAME} (relaying, {unread} unread)" if unread
                     else f"{APP_NAME} (relaying)"
@@ -3512,12 +3582,6 @@ def main() -> int:
             icon_state["relaying"] = on
         _refresh_icon()
         logger.info(f"icon: relaying={on}")
-
-    def on_ussd_state_change(on: bool):
-        with icon_state_lock:
-            icon_state["ussd_running"] = on
-        _refresh_icon()
-        logger.info(f"icon: ussd_running={on}")
 
     notifier = Notifier(
         cfg, logger, ui_queue,
@@ -3546,33 +3610,37 @@ def main() -> int:
     else:
         logger.info("telina: disabled in config")
 
-    # Daily USSD trigger. Same isolation principle as Telina — exceptions
-    # are caught and logged inside tick(), and the modal-confirmation
-    # gate makes sure no internet outage happens without user consent.
-    ussd: "UssdWatcher | None" = None
-    if cfg.get("ussd_enabled", True):
-        ussd = UssdWatcher(
-            cfg, logger, fetcher.modem, ui_queue,
-            on_state_change=on_ussd_state_change,
-        )
-        ussd_thread = threading.Thread(target=ussd.run, daemon=True)
-        ussd_thread.start()
-        logger.info("ussd: watcher thread started")
+    # MCI panel watcher — reads the remaining-quota figure off the
+    # my.mci.ir API once per day, auto-logging-in via SMS-OTP when the
+    # server returns 401/403. Flow is asynchronous: tick() requests an
+    # OTP and returns immediately; the Fetcher dispatches the digits
+    # via mci.on_otp_received() once the SMS lands in sms_del/. Same
+    # isolation principle as Telina — exceptions in tick() are caught
+    # so a broken MCI poll never affects the main flow.
+    mci: "MciWatcher | None" = None
+    if cfg.get("mci_enabled", True):
+        mci = MciWatcher(cfg, logger, quota_warner=quota_warner)
+        # Wire the OTP callback path: Fetcher saves an MCI OTP SMS →
+        # extracts the digits → calls mci.on_otp_received(code).
+        fetcher.mci_watcher = mci
+        mci_thread = threading.Thread(target=mci.run, daemon=True)
+        mci_thread.start()
+        logger.info("mci: watcher thread started")
     else:
-        logger.info("ussd: disabled in config")
+        logger.info("mci: disabled in config")
 
     def on_log(_icon, _item):
         logger.info("tray: Log clicked")
         ui_queue.put("show_log")
 
-    def on_send_ussd(_icon, _item):
-        logger.info("tray: Send USSD clicked")
-        if ussd is None:
+    def on_check_mci(_icon, _item):
+        logger.info("tray: Check MCI quota clicked")
+        if mci is None:
             logger.warning(
-                "tray: Send USSD ignored — ussd_enabled is false"
+                "tray: Check MCI quota ignored — mci_enabled is false"
             )
             return
-        ussd.trigger_now_force()
+        mci.trigger_now()
 
     def on_exit(_icon, _item):
         logger.info("tray: Exit clicked")
@@ -3622,26 +3690,11 @@ def main() -> int:
                         logger.error(
                             f"opening toast popup failed: {e}", exc_info=True
                         )
-                elif cmd == "ussd_confirm":
-                    on_result = (payload or {}).get("on_result")
-                    try:
-                        show_ussd_confirm_modal(root, on_result=on_result)
-                    except Exception as e:
-                        logger.error(
-                            f"opening ussd modal failed: {e}", exc_info=True
-                        )
-                        # Keep the watcher unblocked: signal cancel so
-                        # its modal-pending flag clears.
-                        if on_result:
-                            try:
-                                on_result("cancel", 0)
-                            except Exception:
-                                pass
                 elif cmd == "show_quota_warning":
                     on_ack = (payload or {}).get("on_ack")
-                    mb = int((payload or {}).get("mb", 0))
+                    gb = float((payload or {}).get("gb", 0))
                     try:
-                        show_quota_warning_popup(root, mb=mb, on_ack=on_ack)
+                        show_quota_warning_popup(root, gb=gb, on_ack=on_ack)
                     except Exception as e:
                         logger.error(
                             f"opening quota popup failed: {e}", exc_info=True
@@ -3659,8 +3712,8 @@ def main() -> int:
                     notifier.stop()
                     usage.stop()
                     relayer.stop()
-                    if ussd is not None:
-                        ussd.stop()
+                    if mci is not None:
+                        mci.stop()
                     if quota_warner is not None:
                         quota_warner.stop()
                     try:
@@ -3675,8 +3728,8 @@ def main() -> int:
     root.after(100, pump_ui)
 
     menu_items = [pystray.MenuItem("Log", on_log)]
-    if ussd is not None:
-        menu_items.append(pystray.MenuItem("Send USSD", on_send_ussd))
+    if mci is not None:
+        menu_items.append(pystray.MenuItem("Check MCI quota", on_check_mci))
     menu_items.append(pystray.MenuItem("Exit", on_exit))
 
     icon = pystray.Icon(
@@ -3695,8 +3748,8 @@ def main() -> int:
         notifier.stop()
         usage.stop()
         relayer.stop()
-        if ussd is not None:
-            ussd.stop()
+        if mci is not None:
+            mci.stop()
         if quota_warner is not None:
             quota_warner.stop()
         try:

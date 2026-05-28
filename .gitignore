@@ -12,6 +12,7 @@ smsFetcher.state.json
 relay_state.json
 usage_state.json
 blacklist.json
+mci_state.json
 
 # python / pyinstaller build artifacts
 __pycache__/

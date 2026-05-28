@@ -8,11 +8,15 @@ grace window, the SMS gets forwarded to a relay phone via FTP-upload + a
 short URL-only outbound SMS, so you receive it remotely. Also polls a
 [Telina hosted-PBX](https://hub.telina.ir/) account for new incoming calls
 and SMSes the caller numbers to a configured phone, so you get notified of
-calls that came in to your PBX while you were away. Once a day, prompts
-the user (with a 30-second-countdown confirmation modal) before running a
-fixed USSD trigger via the modem panel — used to keep the operator's
-unlimited-data add-on (`*10*327#` → `0`) renewed. Runs as a Windows tray
-app.
+calls that came in to your PBX while you were away. Reads the remaining
+internet quota off the [MCI customer panel](https://my.mci.ir/panel) **once
+per local calendar day** (or on demand from the tray menu) via JWT Bearer
+auth refreshed by SMS-OTP. The flow is event-driven: if the session has
+expired, the daily tick POSTs send-otp and returns immediately; whenever
+the Fetcher saves the resulting OTP SMS, it dispatches the digits to the
+MCI watcher to complete verification + deferred quota fetch. When the
+quota drops below a configured threshold, a warning popup fires. Runs as
+a Windows tray app.
 
 ## What's in this folder
 
@@ -48,7 +52,8 @@ When the exe runs for the first time it creates these siblings next to itself:
 | `temp/yyyymmdd-hhmmss.htm` | Each SMS forwarded to the relay phone (deleted on full success) |
 | `relay_state.json`       | First relay attempt (carries per-SMS upload/sent timestamps + failure budget) |
 | `temp/last-calls.json`   | First Telina watcher tick (snapshot of the 5 most-recent CDR `cuid`s) |
-| `ussd_state.json`        | First time the daily USSD trigger fires (or is cancelled) — carries `last_run_date` |
+| `mci_state.json`         | After the first successful MCI panel login — persisted cookies + optional Bearer token, replayed across restarts until the server expires the session |
+| `usage_total/remained_quota.txt` | First MCI panel scrape — one timestamped GB reading per line |
 
 Everything is path-relative to the exe — fully portable, no install needed.
 
@@ -56,16 +61,18 @@ Everything is path-relative to the exe — fully portable, no install needed.
 
 Double-click `smsFetcher.exe`. A green-circle "S" icon appears in the system
 tray. Right-click it for three options (the middle one only when
-`ussd_enabled` is `true`):
+`mci_enabled` is `true`):
 
 - **Log** — opens a modal with today's log file (Esc or Close to dismiss)
-- **Send USSD** — fires the daily USSD trigger immediately, bypassing
-  the confirmation modal, the today-already-done check, the DND check,
-  any active snooze, and the failure cooldown. Use it when you want to
-  refresh the operator's data add-on right now and don't need a
-  confirmation. On success the daily auto-trigger still gets marked
-  done for today, so the modal won't pop later. See
-  [Daily USSD trigger](#daily-ussd-trigger).
+- **Check MCI quota** — force-runs the MCI watcher's tick now, even
+  if today's auto-check has already succeeded. If the session is
+  still valid you'll see a fresh quota reading in the log within a
+  second. If the session has expired, the tick POSTs send-otp and
+  returns immediately — when the MCI OTP SMS lands in `sms_del/` a
+  few seconds later, the Fetcher hands the digits to the watcher,
+  which verifies and fetches the quota in the background. You won't
+  see a toast for the OTP SMS itself (it's routed silently). See
+  [Remaining-quota check via MCI panel](#remaining-quota-check-via-mci-panel).
 - **Exit** — stops the threads and quits
 
 A second launch shows a "smsFetcher is already running" warning and exits — the
@@ -112,13 +119,6 @@ single-instance guard binds `127.0.0.1:50917` (configurable).
   the relay finishes. Yellow is transient — it's a few seconds per
   forward — and always wins over red while it's on. See [SMS relay
   (when you're away)](#sms-relay-when-youre-away) below.
-- **Orange tray icon while the USSD trigger is running.** When the
-  daily USSD flow (auto or manually triggered from the tray menu) is
-  mid-flight, the icon turns orange and the tooltip reads
-  `smsFetcher (running USSD)`. Lasts 5–10 seconds. Orange wins over
-  yellow because USSD briefly drops the LTE link, which is more
-  user-impactful than the relay's brief outbound SMS. See
-  [Daily USSD trigger](#daily-ussd-trigger).
 - **DND respected.** When Windows is in Focus Assist, full-screen game,
   presentation mode, or "do not disturb", the queue **pauses** — no JSON
   gets consumed. As soon as DND clears, the next tick picks up the
@@ -205,12 +205,15 @@ gives full control over click behavior and styling.
   "forward_match_substring": "",
   "forward_replacements": {},
   "forward_regex_replacements": [],
-  "ussd_enabled": true,
-  "ussd_state_file": "ussd_state.json",
-  "quota_warn_enabled": true,
-  "quota_warn_sender": "HAMRAHAVAL",
-  "quota_warn_pattern": "برابر با x مگابایت است",
-  "quota_warn_below_mb": 5000
+  "mci_enabled": true,
+  "mci_username": "9133169571",
+  "mci_interval_seconds": 3600,
+  "mci_state_file": "mci_state.json",
+  "mci_quota_below_gb": 5.0,
+  "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
+  "mci_otp_pattern": "Code:\\s*(\\d+)",
+  "mci_otp_wait_seconds": 120,
+  "mci_quota_log_filename": "remained_quota.txt"
 }
 ```
 
@@ -524,83 +527,221 @@ right tool — it uploads the body as an HTML page and SMSes only the
 short URL, which fits inside the ASCII send budget regardless of body
 content.
 
-## Quota-low warning
+## Remaining-quota check via MCI panel
 
-A second receipt-time hook on the Fetcher: when an SMS arrives from a
-configured sender, parse a quota number out of the body and pop a
-warning toast if the value falls below a configured threshold. Wired
-up specifically for the operator's quota-status reply (the SMS that
-follows the daily USSD trigger — see
-[Daily USSD trigger](#daily-ussd-trigger)), but the sender, pattern,
-and threshold are all config-driven so it can be re-purposed.
+A separate thread reads the remaining-internet-quota figure off the
+[MCI customer panel](https://my.mci.ir/panel) **once per local
+calendar day** — and on demand from the tray menu's `Check MCI
+quota`. When the reading drops below `mci_quota_below_gb`, a warning
+popup fires. Every reading is appended (or updated, keyed by
+timestamp) to `usage_total/<mci_quota_log_filename>` (default
+`remained_quota.txt`) so a history is built up regardless of
+threshold.
 
-Example operator reply (sender `HAMRAHAVAL`):
+Authentication is **JWT Bearer**, persisted across runs. The watcher
+stores `cookies + bearer + last_check_date` in `mci_state.json` and
+replays the JWT on every quota GET. The MCI server expires the
+session eventually (observed empirically as "many days to a few
+weeks") — when it does, the next quota GET returns 401/403 and the
+watcher transparently runs the OTP refresh.
 
-```
-مشترک گرامی
-اشتراک اینترنت پرو شما به شرح زیر میباشد:
-1. اشتراک اینترنت پایدار با 50گیگابایت هدیه برای شما فعال است. حجم
-باقی مانده تا ساعت 22:31:15 تاریخ 1405/02/20 ، برابر با 50599
-مگابایت است.
-…
-```
+### Event-driven OTP flow
 
-Four config keys drive it:
+The defining property of this subsystem is that **send-otp does not
+block**. When the daily quota check needs auth (or the tray menu
+triggers a check while the session is dead), the flow is:
+
+1. `MciWatcher.tick()` → `fetch_quota` → server returns 401/403.
+2. Watcher clears the dead session, sets an in-memory
+   `_pending_quota_check = True` flag, POSTs `send-otp`, and
+   **returns immediately**. The loop is free for the next user action.
+   A cooldown timestamp prevents a second send-otp within
+   `mci_otp_wait_seconds`, so a stuck SMS doesn't burn OTP-after-OTP
+   as the user keeps clicking *Check MCI quota*.
+3. Some seconds later, the OTP SMS arrives at the modem. The Fetcher
+   pulls it on its next inbox poll (or sooner — see below), saves it
+   to `sms_del/` (silent — no toast), and calls
+   `mci_watcher.on_otp_received(code)` with the parsed digits.
+4. `on_otp_received` POSTs `verify` with the code. On 2xx, the JWT
+   is captured from the response body and saved. Then — because
+   `_pending_quota_check` is set — the deferred `fetch_quota` runs,
+   logs the reading, marks today done, and (if below threshold)
+   enqueues a popup.
+
+A nice side-effect of this design: if **you** log in to the MCI
+website yourself in a browser, the OTP SMS that MCI sends *also*
+lands at the modem. The Fetcher dispatches it the same way. The
+watcher's `verify_otp` runs, succeeds, and refreshes our cached
+Bearer — without any quota fetch (`_pending_quota_check` is false,
+since we didn't trigger send-otp). Next day's auto-check then
+benefits from an already-fresh session and skips the OTP step
+entirely. If the OTP was already consumed by your browser before
+the Fetcher's poll cycle reached the SMS, our verify just fails
+quietly and the session state is left as-is.
+
+### Day tracking and scheduling
+
+The watcher wakes every `mci_interval_seconds` (default 3600 s = 1 h)
+but most ticks are no-ops. A tick *acts* only when **either**:
+
+- It's a new local calendar day (today's date ≠ persisted
+  `last_check_date`).
+- The user clicked *Check MCI quota* on the tray menu since the last
+  tick (`_force_run` flag set by `trigger_now()`).
+
+`last_check_date` is written **on success** (after a successful
+quota read, regardless of whether OTP refresh was needed). A failure
+to fetch (network error, 5xx from MCI) leaves it unwritten, so the
+next hourly tick retries — but a 401-then-send-otp leaves it
+unwritten too, deliberately: today isn't "done" until we actually
+read the quota. The deferred quota fetch from `on_otp_received` is
+what writes today's date.
+
+This subsystem replaces an older USSD-based path (`*10*327#` → reply
+`0` → cancel via the modem panel, plus an SMS-receipt parser for
+the operator's reply text). The USSD path was retired because (a)
+the operator rate-limited the daily USSD code, (b) parsing free-form
+Persian SMS bodies for the quota number was fragile, and (c) the
+MCI panel exposes a clean JSON API. If the operator's `اشتراک پرو`
+unlimited-data add-on needs periodic *renewal* (rather than just
+*reading*), that step now has to be done by hand from the panel — the
+app no longer triggers it automatically. Set `mci_enabled` to
+`false` to skip the MCI subsystem entirely.
+
+### Config keys
 
 | key | default | meaning |
 | --- | ------- | ------- |
-| `quota_warn_enabled` | `true` | Master toggle. Off → no parsing, no popup. |
-| `quota_warn_sender` | `"HAMRAHAVAL"` | Exact sender id match. Empty string disables the feature even if enabled. |
-| `quota_warn_pattern` | `"برابر با x مگابایت است"` | The body must contain this string with a digit run in place of `x`. Everything except the first `x` is matched as a literal (regex-escaped); `x` becomes `(\d+)`. |
-| `quota_warn_below_mb` | `5000` | Threshold (MB). Pop the warning only when the parsed value is strictly less than this. |
+| `mci_enabled` | `true` | Master toggle. Off → no MciWatcher thread, no QuotaWarner thread, no `Check MCI quota` tray item. |
+| `mci_username` | `"9133169571"` | 10-digit Iran mobile number registered with MCI (no leading 0, no country code — the panel expects it bare). |
+| `mci_interval_seconds` | `3600` | How often the watcher loop wakes to **check** whether today's quota check is due. With the calendar-day gate, this is effectively "how stale a daily-rollover detection is allowed to be." 1 h is fine for the daily check; tighter just burns CPU on no-op ticks. |
+| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `last_check_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of "today done" on next tick. |
+| `mci_quota_below_gb` | `5.0` | Threshold in GB. Pop the warning only when the scraped value is strictly less than this. |
+| `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. (a) the Fetcher routes matching SMSes straight to `sms_del/` so the OTP doesn't pop a toast; (b) right after saving, it extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. |
+| `mci_otp_pattern` | `"Code:\\s*(\\d+)"` | Regex extracting the OTP digits from the SMS body. First capture group is the code. |
+| `mci_otp_wait_seconds` | `120` | Cooldown after a `send-otp` — the watcher won't re-send for this long, even if a fresh tick triggers a new auth need. Prevents burning OTPs when an SMS gets stuck. Reset to zero on a successful verify. |
+| `mci_quota_log_filename` | `"remained_quota.txt"` | Filename inside `usage_total/` for the history log. |
 
-### How the check fires
+### Endpoints
 
-The Fetcher calls the check in `cycle()` after each saved SMS,
-regardless of whether the sender is blacklisted — quota info is
-useful even when the user has muted the sender's normal popups. Flow:
+Three hardcoded URLs (constants `MCI_API_BASE`,
+`MCI_ENDPOINT_SEND_OTP`, `MCI_ENDPOINT_VERIFY_OTP`,
+`MCI_ENDPOINT_QUOTA` in `smsFetcher.py`):
 
-1. Skip if `quota_warn_enabled` is false or `quota_warn_sender` is
-   empty.
-2. Skip if the SMS sender doesn't exactly equal `quota_warn_sender`.
-3. Skip with a warning log if `quota_warn_pattern` has no `x`
-   placeholder.
-4. Build a regex by splitting on the first `x`, regex-escaping the
-   two sides, and joining them with `(\d+)`. So
-   `"برابر با x مگابایت است"` becomes
-   `re.escape("برابر با ") + r"(\d+)" + re.escape(" مگابایت است")`.
-5. Run `re.search` on the body. No match → log and stop.
-6. Parse the captured group as `int`. Below threshold → enqueue a
-   warning; at-or-above → just log the parsed value and stop.
+1. **`GET /api/unit/v1/packages/details`** — returns a JSON envelope
+   with `totalUnusedBytes` (a float in GB on this account, despite
+   the field name implying bytes), `bytesUnusedUnit` (`"گیگ"`), and
+   per-package breakdowns we don't read. Auth via `Authorization:
+   Bearer <jwt>`. On 401/403 the watcher clears its session and
+   transitions to the OTP refresh path.
+2. **`POST /api/idm/v1/auth/send-otp`** with JSON
+   `{"username": "<mci_username>"}` — MCI sends a 5-digit code SMS
+   to the registered SIM.
+3. **`POST /api/idm/v1/auth`** with JSON
+   `{"username": "<mci_username>", "credential": "<code>", "credential_type": "OTP"}`
+   — response carries `{"access_token": "<JWT>"}`. The JWT is added
+   as `Authorization: Bearer …` on the session and persisted.
 
-Every step logs (with prefix `quota:`), so a broken pattern or a
-sender-id-changes-overnight situation is debuggable from the daily
-log file alone.
+### History log
+
+`usage_total/<mci_quota_log_filename>` — one line per scrape, with a
+local timestamp prefix and a 2-decimal GB value:
+
+```
+2026/05/28 09:00:00  33.31 GB
+2026/05/29 09:00:00  31.04 GB
+2026/05/30 09:00:00  28.92 GB
+```
+
+Lines are deduped by timestamp prefix and the file is kept sorted
+chronologically. With a 1-hour-granularity poll and once-per-day
+acting cadence, you typically get one line per day; the tray-menu
+*Check MCI quota* adds extra readings whenever you trigger it. If
+the threshold drops, all readings (above and below threshold) still
+land in the log; the threshold only gates the popup.
 
 ### The popup
 
 Bottom-right Tk popup using the same stacking slot system as the SMS
 toasts, so a quota warning can appear alongside an SMS toast without
-overlapping. Distinguishing features:
+overlapping:
 
 - **Orange accent bar** (vs the SMS toast's blue) — visually
   separable at a glance.
 - **Header**: `Internet quota low`.
-- **Body**: `Internet quota is low: <N> MB remaining.`
-- **One button**: Dismiss. There's no Open / Block — this isn't an
-  SMS, it's a warning derived from one. (The originating SMS itself
-  still gets its own popup unless the sender is blacklisted.)
+- **Body**: `Internet quota is low: <N.NN> GB remaining.`
+- **One button**: Dismiss.
 
 The popup is **deferred under DND / Focus Assist / fullscreen** —
-same gating as the SMS toasts. A separate watcher thread holds a
-FIFO of pending warnings and pops one when Windows accepts
-notifications again. So a low-quota SMS arriving mid-game queues a
-warning that appears as soon as you exit fullscreen.
+same gating as the SMS toasts. A separate `QuotaWarner` thread
+drains the FIFO when Windows starts accepting notifications again,
+so a below-threshold scrape mid-game queues a warning that appears
+as soon as you exit fullscreen.
 
-Per the spec, the popup fires **every time** a low-quota SMS is
-received — no dedupe, no per-day cap. If the operator's quota-status
-SMS arrives twice in quick succession (e.g. you ran the USSD
-trigger twice), two warning popups queue up, drained one at a time.
+No dedupe and no per-day cap: every below-threshold scrape enqueues
+a fresh popup. With the daily acting cadence that's at most one
+popup per day from the auto path; manual *Check MCI quota* clicks
+add their own. In practice the quota only crosses the threshold
+once per billing cycle so this rarely matters.
+
+### Tray menu — `Check MCI quota`
+
+Force-runs the watcher's tick now, even if today is already done
+(`_force_run` flag clears `_last_check_date == today` short-circuit
+for one tick). If the session is still valid you get a fresh
+reading in the log within a second. If it isn't, the tick fires
+send-otp + returns; the SMS arrival path completes the read
+asynchronously, same as the daily auto path.
+
+The menu item is only present when `mci_enabled` is true.
+
+### Auth shape — Bearer JWT, not cookies
+
+Confirmed by end-to-end test against the live server (2026-05-28):
+the verify response returns a JSON body
+`{"access_token": "<JWT, ~780 chars>"}`, with no auth `Set-Cookie`.
+The only cookie set during the whole flow is `cookiesession1`, which
+is the WAF's session-bootstrap cookie and **does not authorize the
+quota GET** by itself. `MciClient.verify_otp` extracts the JWT
+(checking `access_token` / `token` / `accessToken` / `id_token` at
+the top level and one level deep under `data`) and adds it as
+`Authorization: Bearer <jwt>` on the session — that header is what
+the quota GET checks. The verify log line records
+`cookies=N, bearer=yes/no`; if you ever see `bearer=no` followed by
+a 401/403 loop, MCI changed the response shape and you need to add
+the new key to the `candidates` tuple.
+
+### WAF — TLS fingerprinting blocks some clients
+
+The MCI panel sits behind a CDN/WAF (likely ArvanCloud) that
+fingerprints the TLS handshake. In testing, Windows' bundled
+`curl.exe` (built with Schannel) is **blocked** at the edge with
+`HTTP 599 "Blocked!! Malicious Activity!!"` — even with a complete
+Chrome-shaped header set, even with a primed session cookie.
+Python `requests` (OpenSSL via urllib3) passes fine, which is what
+smsFetcher uses. The practical implication: **don't try to debug
+this subsystem with curl on Windows** — write a Python one-off
+instead. If the fingerprint rules tighten in the future and Python
+also starts getting blocked, the escape hatch is `curl_cffi` (a
+Chrome-impersonating curl wrapper for Python).
+
+### Other caveats and assumptions
+
+- **Browser-shaped request headers.** Origin / Referer / User-Agent
+  are hardcoded to look like Chrome on Windows. If MCI's CDN starts
+  challenging unusual user-agents, update `MciClient._COMMON_HEADERS`.
+- **OTP race vs the user's browser.** If you happen to be logging
+  into the MCI website manually around the same time as the daily
+  auto-tick, both your browser and the watcher will try to consume
+  the OTP. First write wins. The losing side fails — `verify_otp`
+  returns non-2xx — and is logged but otherwise harmless. In practice
+  the Fetcher's modem poll cadence (500 s default) is much slower
+  than human typing, so your browser almost always wins; the watcher
+  then just fails to verify and waits for next day's tick (or your
+  next *Check MCI quota* click).
+- **No `اشتراک پرو` auto-renewal.** The old USSD-based renewal trigger
+  is gone. If your data add-on needs periodic renewal, do it
+  manually from the panel.
 
 ## LTE usage tracking
 
@@ -839,126 +980,6 @@ startup, which is almost never what the user wants.
 A corrupt-but-present state file is treated the same as "no new" —
 we suppress one tick rather than fire 5 unwanted SMSes.
 
-## Daily USSD trigger
-
-A separate thread fires `*10*327#` at most once per local calendar day
-to keep the operator's `اشتراک پرو` (unlimited-data) add-on renewed.
-The flow is short — three POSTs to the modem panel — but the LTE link
-goes down briefly while the modem talks to the network, so the trigger
-is gated behind a confirmation modal.
-
-### What gets sent, in order
-
-1. **Defensive cancel** — `POST /boafrm/formUSSDSetup` with
-   `ussdStatusInput=menu, ussdCancelInput=1`. Clears any previous
-   USSD session that might be hanging from a panel left open in a
-   browser tab.
-2. **Send the code** — POST with `ussdValue=*10*327#,
-   ussdStatusInput=ussd, ussdCancelInput=0`. The response body is the
-   re-rendered `/ussd.htm` with `var ussdStatus = '1'` and the
-   network's menu text rendered server-side into the
-   `ussd_menu_id` div (UTF-8, with `<br>` line breaks):
-   ```
-   اشتراک پرو
-   0.استعلام
-   1.وصل
-   2.قطع
-   3.خرید اشتراک
-   4.احراز هویت
-   9.راهنما
-   ```
-   The watcher asserts that the substring `"اشتراک پرو"` is present;
-   otherwise the menu didn't arrive (dialled into the wrong target,
-   network unreachable, etc.) and the run is treated as a failure.
-3. **Reply `0`** — POST with `selectMenuValue=0,
-   ussdStatusInput=menu, ussdCancelInput=0`. Response again carries
-   `ussdStatus=1` (the firmware reuses state `1` for both
-   interactive menus and the network's final reply — see
-   [Sending USSD codes](#sending-ussd-codes)). The new
-   `ussd_menu_id` content is the network's acknowledgement:
-   ```
-   مشترک گرامی درخواست شما بررسی و نتیجه از طریق پیامک ارسال خواهد شد.
-   ```
-   The watcher asserts the substring `"درخواست شما"` is present.
-4. **Cancel** — POST with `ussdStatusInput=menu, ussdCancelInput=1`.
-   Closes the USSD session (`ussdStatus` returns to `2`).
-
-### Confirmation modal
-
-Before any of the above runs, a Tk modal pops up titled
-`smsFetcher - Send USSD?` with body `Ready to send USSD code?
-Internet will be disconnected for a while.`, a `Snooze time:`
-dropdown (`10min` / `30min` / `1 hour` / `2 hours` / `3 hours`,
-default `10min`), and three buttons:
-
-- **Cancel** — marks today as done and skips the trigger entirely.
-  The next attempt is tomorrow (or whenever the local calendar date
-  changes next).
-- **Snooze** — re-shows the modal after the selected interval.
-  In-memory only; an app restart re-evaluates from `last_run_date`
-  alone (a snooze does not survive restart, but a Cancel does
-  because it persists).
-- **Go ahead! (30)** — runs the flow now. The button label is a
-  countdown; if the user does nothing, the modal auto-clicks Go
-  ahead at zero, since a forgotten modal shouldn't silently block
-  the daily renewal.
-
-### Day tracking and scheduling
-
-`ussd_state.json` carries one field — `last_run_date` (local
-`YYYY-MM-DD`). The watcher ticks every 60 s and shows the modal
-when **all** of these are true:
-
-- `ussd_enabled` is `true`.
-- The persisted `last_run_date` differs from today's local date
-  (or is missing — fresh install fires on first run).
-- Windows is **not** in DND / Focus Assist / fullscreen
-  (`SHQueryUserNotificationState`-gated, same as the SMS popups).
-- No modal is already pending.
-- We're past any active snooze window.
-- We're past the failure cooldown (1 hour after the previous
-  attempt failed — protects the user from a modal-storm if the
-  modem keeps refusing the menu).
-
-A successful flow OR an explicit Cancel writes today's date to
-`ussd_state.json`. A failure leaves the date unwritten so the next
-hourly cooldown elapses and the modal returns. A startup grace of
-15 s lets the rest of the app initialise before the first possible
-modal.
-
-The check is calendar-day-based, not 24-hour-based, so a run at
-22:00 today still counts as today's run — the next eligibility is
-00:00 tomorrow. Missed days (PC powered off > 24 h) collapse to a
-single eligibility on next launch (we don't backfill).
-
-### Manual trigger from the tray
-
-The tray menu's **Send USSD** item runs the same flow but skips every
-gate the auto-watcher applies:
-
-| Gate | Auto (modal Go ahead) | Manual (Send USSD) |
-| ---- | --------------------- | ------------------ |
-| Confirmation modal | Required | Skipped |
-| Today already done | Skipped if so | Ignored — fires anyway |
-| DND / Focus Assist / fullscreen | Deferred | Ignored — fires anyway |
-| Active snooze | Deferred | Ignored — fires anyway |
-| Failure cooldown (1 h) | Deferred | Ignored — fires anyway |
-| Single-flight guard | Yes | Yes (no-op if a flow is already running) |
-| `last_run_date` written on success | Yes | Yes — satisfies the daily quota |
-| Failure cooldown set on failure | Yes | Yes |
-
-So **Send USSD** is "do it now" — no questions asked, no waiting. On
-success it still ticks the daily checkbox so the auto-modal won't
-pop later that day.
-
-### Tray icon while running
-
-The tray icon turns **orange** for the 5–10 seconds the flow is
-mid-flight (with tooltip `smsFetcher (running USSD)`), then reverts
-to whichever lower-priority colour applies (yellow if a relay is
-running, red if there are unread popups, green if idle). This makes
-the brief LTE outage visible at a glance.
-
 ## How it works (modem reverse-engineering reference)
 
 The modem runs two HTTP servers behind port 80: **Boa/0.94.14rc21** (login) and
@@ -1053,51 +1074,6 @@ the second threshold. The match-based forward path
 text lands well under 30 chars before going out. If a feature needs
 to send more than that, route the content through the FTP-upload +
 URL-only relay instead of the direct send.
-
-### Sending USSD codes
-
-USSD goes through a different form on a different page. The form
-posts to `/boafrm/formUSSDSetup` with `submit-url=/ussd.htm`,
-Referer `/ussd.htm`, and four fields:
-
-| field             | meaning |
-| ----------------- | ------- |
-| `ussdValue`       | The USSD code, when starting a fresh session (e.g. `*10*327#`). |
-| `selectMenuValue` | The menu reply, when an interactive USSD session is active (e.g. `0`). |
-| `ussdStatusInput` | `ussd` to start a fresh session, `menu` to reply to or cancel one. |
-| `ussdCancelInput` | `0` for a normal send / reply, `1` to cancel the active session. |
-
-The response body is the re-rendered `/ussd.htm` itself — there is
-no JSON envelope and no separate result poll. Two pieces of data
-are scraped out of the HTML:
-
-- `var ussdStatus = '<n>'` — `0` = idle, `1` = active session
-  (interactive menu OR network's final reply), `2` = Fail / closed.
-  The firmware reuses state `1` for both menus and final replies on
-  this hardware, so success detection has to match the response
-  text, not a status transition.
-- `<div id="ussd_menu_id">…</div>` — the network's text rendered
-  server-side, with `<br>` line breaks. UTF-8.
-
-Three call shapes:
-
-```
-# Send a code
-ussdValue=*10*327#  selectMenuValue=  ussdStatusInput=ussd  ussdCancelInput=0
-
-# Reply to an active menu
-ussdValue=  selectMenuValue=0  ussdStatusInput=menu  ussdCancelInput=0
-
-# Cancel the active session
-ussdValue=  selectMenuValue=  ussdStatusInput=menu  ussdCancelInput=1
-```
-
-The full flow that the [Daily USSD trigger](#daily-ussd-trigger)
-runs (defensive cancel, send code, reply, cancel) takes ~5–10 s
-end-to-end and disconnects the LTE link briefly while the modem
-talks to the network. The panel's own page does the same defensive
-cancel via an `onbeforeunload` AJAX when the user navigates away —
-that's where the watcher's pre-reset call came from.
 
 ### Outbox listing & delete
 
@@ -1232,12 +1208,13 @@ The log writer rolls over at midnight (next entry opens
   `forward_enabled` and the new message matches
   `forward_match_sender` + `forward_match_substring`, also fires a
   one-shot `send_sms` of the body to `telina_notif_number` (see
-  [Match-based SMS forward](#match-based-sms-forward)). Independently,
-  if `quota_warn_enabled` and the sender matches `quota_warn_sender`,
-  parses the body for a quota number and enqueues a warning popup if
-  it falls below `quota_warn_below_mb` (see
-  [Quota-low warning](#quota-low-warning)). Both hooks fire whether
-  or not the sender is blacklisted.
+  [Match-based SMS forward](#match-based-sms-forward)). If
+  `mci_enabled` and the SMS body contains `mci_otp_match_substring`,
+  the message is routed straight to `sms_del/` at save time (no
+  popup) AND the digits are extracted via `mci_otp_pattern` and
+  dispatched to `MciWatcher.on_otp_received(code)` for verify +
+  deferred quota fetch (see
+  [Remaining-quota check via MCI panel](#remaining-quota-check-via-mci-panel)).
 - **Notifier** — every `notification_interval_seconds` (60 s default), checks
   DND state and (if OK) pops the oldest JSON from `sms/` into a Tk
   popup window, then moves it to `sms_del/`.
@@ -1254,23 +1231,30 @@ The log writer rolls over at midnight (next entry opens
   `sms_del/` retention sweep (every 6 h). State (per-SMS upload/sent
   timestamps, failure budget, pause-until) lives in
   `relay_state.json`.
+- **MciWatcher** — wakes every `mci_interval_seconds` (3600 s = 1 h
+  default); most ticks are no-ops. When the local calendar date
+  differs from the persisted `last_check_date` (or the tray menu
+  forced a run), GETs `/api/unit/v1/packages/details`; on 401/403,
+  POSTs `send-otp` and returns immediately — no synchronous wait.
+  Receives the OTP digits asynchronously via
+  `on_otp_received(code)`, which the Fetcher calls when the SMS
+  arrives. After verify, runs the deferred fetch_quota, logs the
+  reading, marks today done, and (if below `mci_quota_below_gb`)
+  enqueues a popup via QuotaWarner. Also processes spontaneous
+  OTPs from the user's own browser logins (refreshes our session
+  opportunistically). Exposed via the tray menu's **Check MCI
+  quota** item, which sets `_force_run` so the next tick re-runs
+  even if today is already done. Skipped entirely when
+  `mci_enabled` is `false`. See [Remaining-quota check via MCI
+  panel](#remaining-quota-check-via-mci-panel).
 - **QuotaWarner** — ticks every 15 s, but most ticks are no-ops.
-  Drains a FIFO of pending quota-low warnings (pushed by the Fetcher
-  via `enqueue(mb)` when a low-quota SMS is parsed) into bottom-right
-  Tk popups one at a time. Gated by `accepts_notifications()` so it
-  defers under DND. Skipped entirely when `quota_warn_enabled` is
-  `false`. See [Quota-low warning](#quota-low-warning).
-- **UssdWatcher** — ticks every 60 s, but most ticks are no-ops.
-  Once per local calendar day it queues a Tk confirmation modal
-  (Snooze / Go ahead / Cancel; 30 s auto-Go countdown); on Go ahead
-  it runs `*10*327#` → `0` → cancel against the modem panel to
-  refresh the operator's unlimited-data add-on. Modal is deferred
-  while Windows is in DND / Focus Assist / fullscreen. Also exposes
-  a manual fire path via the tray menu's **Send USSD** item that
-  bypasses every gate (modal, today-done, DND, snooze, cooldown).
-  Tray icon turns **orange** while the flow is running. Day tracking
-  via `last_run_date` in `ussd_state.json`. Skipped entirely when
-  `ussd_enabled` is `false`. See [Daily USSD trigger](#daily-ussd-trigger).
+  Drains a FIFO of pending quota-low warnings (pushed by the
+  MciWatcher via `enqueue(gb)` after a below-threshold scrape) into
+  bottom-right Tk popups one at a time. Gated by
+  `accepts_notifications()` so it defers under DND. Started only
+  when `mci_enabled` is `true` (since MciWatcher is the sole
+  producer). See [Remaining-quota check via MCI
+  panel](#remaining-quota-check-via-mci-panel).
 - **TelinaWatcher** — every `telina_interval_seconds` (1800 s = 30 min
   default), logs in to the Telina hub via GraphQL, fetches the 5
   most-recent CDR rows from the PBX panel via tRPC, diffs by `cuid`
