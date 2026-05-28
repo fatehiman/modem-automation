@@ -2479,25 +2479,31 @@ class TelinaWatcher:
 # ---------- quota-low warning ----------
 
 class QuotaWarner:
-    """Drains a FIFO of quota-low warnings into bottom-right Tk popups,
-    one at a time, only while Windows accepts notifications. The
-    MciWatcher calls `enqueue(gb)` after each panel scrape that reads
-    a remaining quota below the configured threshold; the popup may
-    appear seconds or hours later, depending on DND state.
+    """Drains a FIFO of MCI quota-related notifications into
+    bottom-right Tk popups, one at a time, only while Windows accepts
+    notifications. The MciWatcher calls one of three enqueue methods
+    after each panel interaction:
+
+    - ``enqueue_warning(gb)`` — below-threshold scrape (orange accent).
+    - ``enqueue_info(gb)``    — normal scrape, user wants to know
+                                 the figure (green accent).
+    - ``enqueue_error(msg)``  — fetch / auth failure (red accent).
 
     Why a separate thread instead of dispatching the popup straight
-    from the watcher: panel scrapes happen on a fixed interval, but
-    the popup needs to defer under DND/Focus Assist/fullscreen (same
-    as the SMS toast popups). Keeping the queue here decouples those
-    two concerns and means a backlog of warnings drains cleanly when
-    the user comes out of DND."""
+    from the watcher: the popup needs to defer under DND / Focus
+    Assist / fullscreen (same gating as the SMS toast popups). Keeping
+    the queue here decouples those two concerns, so a backlog of
+    notifications drains cleanly when the user comes out of DND."""
 
     TICK_SECONDS = 15
 
     def __init__(self, ui_queue: "queue.Queue", logger: logging.Logger):
         self.ui_queue = ui_queue
         self.logger = logger
-        self._pending: "list[float]" = []
+        # Each item: {"kind": "warning"|"info"|"error", "value": ...}
+        # where value is float GB for warning/info and str message for
+        # error.
+        self._pending: "list[dict]" = []
         self._lock = threading.Lock()
         self._showing = False
         self._stop = threading.Event()
@@ -2507,16 +2513,37 @@ class QuotaWarner:
         self._stop.set()
         self._wake.set()
 
-    def enqueue(self, gb: float):
-        """Called from the MciWatcher thread after a low-quota scrape.
-        Each call queues a fresh popup — no dedupe."""
+    def _enqueue(self, item: dict, log_line: str):
         with self._lock:
-            self._pending.append(float(gb))
-        self.logger.info(
-            f"quota: enqueued warning for {gb:.2f} GB "
-            f"(pending={len(self._pending)})"
-        )
+            self._pending.append(item)
+            depth = len(self._pending)
+        self.logger.info(f"{log_line} (pending={depth})")
         self._wake.set()
+
+    def enqueue_warning(self, gb: float):
+        """Low-quota warning. The MciWatcher routes here when the
+        scraped value is below ``mci_quota_below_gb``."""
+        self._enqueue(
+            {"kind": "warning", "value": float(gb)},
+            f"quota: enqueued warning for {gb:.2f} GB",
+        )
+
+    def enqueue_info(self, gb: float):
+        """Informational notification with the latest quota figure.
+        Fires on successful fetches that the user should see — every
+        manual tray-menu trigger and the first auto-fetch each day."""
+        self._enqueue(
+            {"kind": "info", "value": float(gb)},
+            f"quota: enqueued info for {gb:.2f} GB",
+        )
+
+    def enqueue_error(self, message: str):
+        """Error notification. Fires on auth/fetch failures the user
+        should know about (same gating as info)."""
+        self._enqueue(
+            {"kind": "error", "value": str(message)},
+            f"quota: enqueued error: {message!r}",
+        )
 
     def _on_ack(self):
         # Tk-thread callback: popup just closed. Allow the next tick to
@@ -2532,12 +2559,22 @@ class QuotaWarner:
         if not accepts_notifications():
             return
         with self._lock:
-            gb = self._pending.pop(0)
+            item = self._pending.pop(0)
             self._showing = True
-        self.ui_queue.put(
-            ("show_quota_warning", {"gb": gb, "on_ack": self._on_ack})
-        )
-        self.logger.info(f"quota: showing warning popup for {gb:.2f} GB")
+        kind = item["kind"]
+        value = item["value"]
+        self.ui_queue.put((
+            "show_quota_popup",
+            {"kind": kind, "value": value, "on_ack": self._on_ack},
+        ))
+        if isinstance(value, float):
+            self.logger.info(
+                f"quota: showing {kind} popup for {value:.2f} GB"
+            )
+        else:
+            self.logger.info(
+                f"quota: showing {kind} popup ({str(value)[:80]!r})"
+            )
 
     def run(self):
         while not self._stop.is_set():
@@ -2933,6 +2970,16 @@ class MciWatcher:
         self._pending_quota_check = False
         self._last_otp_sent_at: "float | None" = None
         self._force_run = False
+        # Whether the next decisive outcome (success or final error) of
+        # the current auth/fetch attempt should pop a user-facing
+        # notification. Set by tick() before each acting attempt — true
+        # on manual trigger, or on auto attempts when today != the
+        # persisted ``last_notify_date`` (i.e. we haven't already
+        # notified the user once today). Reset to false after any popup
+        # is enqueued. Sticky across the async OTP-wait window: if tick
+        # set it true and an OTP later arrives, the deferred outcome
+        # still notifies.
+        self._pending_notify = False
 
     def stop(self):
         self._stop.set()
@@ -2971,6 +3018,13 @@ class MciWatcher:
     def _mark_today_done(self):
         self.client.set_extra("last_check_date", self._today_str())
 
+    def _last_notify_date(self) -> "str | None":
+        v = self.client.get_extra("last_notify_date")
+        return str(v) if v else None
+
+    def _mark_notified_today(self):
+        self.client.set_extra("last_notify_date", self._today_str())
+
     # ---- tick (auto or tray-triggered) ----
 
     def tick(self):
@@ -2981,12 +3035,19 @@ class MciWatcher:
             last = self._last_check_date()
             if not force and last == today:
                 return
+            # Decide whether the outcome of this attempt should notify.
+            # Manual: always. Auto: only if we haven't already notified
+            # the user today (prevents popup spam during multi-hour
+            # outages where the hourly tick keeps failing).
             if force:
                 self.logger.info("mci: force-triggered tick")
+                self._pending_notify = True
             else:
                 self.logger.info(
                     f"mci: daily tick (today={today}, last_check_date={last})"
                 )
+                if self._last_notify_date() != today:
+                    self._pending_notify = True
             self._try_fetch_or_request_otp()
 
     def _try_fetch_or_request_otp(self):
@@ -3001,6 +3062,7 @@ class MciWatcher:
             return
         except Exception as e:
             self.logger.error(f"mci: fetch_quota error: {e}")
+            self._notify_error(f"Failed to fetch quota: {e}")
             return
         self._on_quota_success(result)
 
@@ -3026,6 +3088,7 @@ class MciWatcher:
             )
         except Exception as e:
             self.logger.error(f"mci: request_otp failed: {e}")
+            self._notify_error(f"Failed to start auth: {e}")
 
     # ---- OTP callback from the Fetcher ----
 
@@ -3052,6 +3115,13 @@ class MciWatcher:
                     f"mci: verify_otp failed: {e} "
                     "(may have been consumed elsewhere — fine)"
                 )
+                # Only surface a notification if a quota check was
+                # actually depending on this verify. A failing verify
+                # for a spontaneous (user-browser) OTP isn't actionable
+                # for the user.
+                if self._pending_quota_check:
+                    self._pending_quota_check = False
+                    self._notify_error(f"Verify failed: {e}")
                 return
             # Successful verify ends the auth cycle, so any subsequent
             # 401 should be allowed to request OTP again without waiting
@@ -3070,6 +3140,9 @@ class MciWatcher:
                 self.logger.error(
                     f"mci: deferred fetch_quota after verify failed: {e}"
                 )
+                self._notify_error(
+                    f"Failed to fetch quota after auth: {e}"
+                )
                 return
             self._on_quota_success(result)
 
@@ -3081,14 +3154,42 @@ class MciWatcher:
         self.logger.info(f"mci: remaining quota = {gb:.2f} {unit}")
         self._log_quota_line(gb)
         self._mark_today_done()
+        if self.quota_warner is None:
+            self.logger.warning(
+                f"mci: {gb:.2f} GB read but no quota_warner is wired up"
+            )
+            self._pending_notify = False
+            return
+        # Below-threshold readings always pop the orange warning,
+        # regardless of pending_notify — the warning is more urgent
+        # than the "first-of-day" gate. Normal readings only pop the
+        # info popup when this attempt was flagged notify-worthy.
         if gb < self.threshold_gb:
-            if self.quota_warner is not None:
-                self.quota_warner.enqueue(gb)
-            else:
-                self.logger.warning(
-                    f"mci: {gb:.2f} GB < threshold {self.threshold_gb} GB "
-                    "but no quota_warner is wired up"
-                )
+            self.quota_warner.enqueue_warning(gb)
+            self._mark_notified_today()
+        elif self._pending_notify:
+            self.quota_warner.enqueue_info(gb)
+            self._mark_notified_today()
+        self._pending_notify = False
+
+    # ---- error notification ----
+
+    def _notify_error(self, message: str):
+        """Enqueue an error popup if this attempt was flagged
+        notify-worthy by tick(). Always logs at the call sites.
+        Clears ``_pending_notify`` and stamps ``last_notify_date`` so
+        same-day retries don't spam."""
+        if not self._pending_notify:
+            return
+        self._pending_notify = False
+        if self.quota_warner is None:
+            self.logger.warning(
+                f"mci: would notify error but no quota_warner is wired up: "
+                f"{message}"
+            )
+            return
+        self.quota_warner.enqueue_error(message)
+        self._mark_notified_today()
 
     # ---- file log ----
 
@@ -3322,16 +3423,47 @@ def show_toast_popup(parent: tk.Tk, sender: str, body: str, on_ack):
     body_lbl.bind("<Button-1>", lambda _e: _close("open"))
 
 
-# Distinct accent for the quota-low warning so it's visually separable
-# from a regular SMS toast when both are on screen at the same time.
-POPUP_ACCENT_WARN = "#e07a3a"  # orange
+# Accent colours for MCI quota popups — chosen to be distinguishable
+# both from each other and from the SMS toast's blue.
+POPUP_ACCENT_WARN = "#e07a3a"   # orange  — low quota
+POPUP_ACCENT_INFO = "#3aa84a"   # green   — normal quota reading
+POPUP_ACCENT_ERROR = "#c93838"  # red     — fetch / auth failure
 
 
-def show_quota_warning_popup(parent: tk.Tk, gb: float, on_ack):
-    """Bottom-right Tk warning popup with the scraped remaining quota
-    (GB). Stacks alongside SMS toasts via the same TOAST_SLOTS, with
-    an orange accent bar instead of blue to flag it as a warning.
-    on_ack() is called exactly once when the popup is dismissed."""
+def show_quota_popup(parent: tk.Tk, kind: str, value, on_ack):
+    """Bottom-right Tk popup for MCI quota events. ``kind`` is one of:
+
+    - ``"warning"``: ``value`` is float GB; body reads
+      ``"Internet quota is low: N.NN GB remaining."`` (orange).
+    - ``"info"``:    ``value`` is float GB; body reads
+      ``"Remaining quota: N.NN GB."`` (green).
+    - ``"error"``:   ``value`` is a string message; body shows the
+      error (red).
+
+    Stacks alongside SMS toasts via the same TOAST_SLOTS. on_ack() is
+    called exactly once when the popup is dismissed."""
+    if kind == "warning":
+        accent = POPUP_ACCENT_WARN
+        header_text = "Internet quota low"
+        body_text = f"Internet quota is low: {float(value):.2f} GB remaining."
+    elif kind == "info":
+        accent = POPUP_ACCENT_INFO
+        header_text = "MCI quota update"
+        body_text = f"Remaining quota: {float(value):.2f} GB."
+    elif kind == "error":
+        accent = POPUP_ACCENT_ERROR
+        header_text = "MCI quota fetch failed"
+        # Keep the body to a reasonable size — modem-side errors can be
+        # long. The full message is in the log file.
+        msg = str(value)
+        if len(msg) > 240:
+            msg = msg[:240].rstrip() + "…"
+        body_text = msg
+    else:
+        accent = POPUP_ACCENT_INFO
+        header_text = "MCI quota"
+        body_text = str(value)
+
     slot = TOAST_SLOTS.claim()
     win = tk.Toplevel(parent)
     win.overrideredirect(True)
@@ -3360,7 +3492,7 @@ def show_quota_warning_popup(parent: tk.Tk, gb: float, on_ack):
         except Exception:
             pass
 
-    bar = tk.Frame(win, bg=POPUP_ACCENT_WARN, width=4)
+    bar = tk.Frame(win, bg=accent, width=4)
     bar.pack(side="left", fill="y")
 
     inner = tk.Frame(win, bg=POPUP_BG)
@@ -3369,7 +3501,7 @@ def show_quota_warning_popup(parent: tk.Tk, gb: float, on_ack):
     header = tk.Frame(inner, bg=POPUP_BG)
     header.pack(fill="x", padx=10, pady=(8, 2))
     tk.Label(
-        header, text="Internet quota low",
+        header, text=header_text,
         bg=POPUP_BG, fg=POPUP_FG,
         font=("Segoe UI", 10, "bold"),
     ).pack(side="left")
@@ -3389,7 +3521,7 @@ def show_quota_warning_popup(parent: tk.Tk, gb: float, on_ack):
     ).pack(side="right")
 
     tk.Label(
-        inner, text=f"Internet quota is low: {gb:.2f} GB remaining.",
+        inner, text=body_text,
         bg=POPUP_BG, fg=POPUP_FG,
         font=("Tahoma", 10),
         wraplength=POPUP_W - 30, justify="left", anchor="nw",
@@ -3690,11 +3822,14 @@ def main() -> int:
                         logger.error(
                             f"opening toast popup failed: {e}", exc_info=True
                         )
-                elif cmd == "show_quota_warning":
+                elif cmd == "show_quota_popup":
                     on_ack = (payload or {}).get("on_ack")
-                    gb = float((payload or {}).get("gb", 0))
+                    kind = str((payload or {}).get("kind", "info"))
+                    value = (payload or {}).get("value")
                     try:
-                        show_quota_warning_popup(root, gb=gb, on_ack=on_ack)
+                        show_quota_popup(
+                            root, kind=kind, value=value, on_ack=on_ack,
+                        )
                     except Exception as e:
                         logger.error(
                             f"opening quota popup failed: {e}", exc_info=True

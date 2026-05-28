@@ -615,7 +615,7 @@ app no longer triggers it automatically. Set `mci_enabled` to
 | `mci_enabled` | `true` | Master toggle. Off → no MciWatcher thread, no QuotaWarner thread, no `Check MCI quota` tray item. |
 | `mci_username` | `"9133169571"` | 10-digit Iran mobile number registered with MCI (no leading 0, no country code — the panel expects it bare). |
 | `mci_interval_seconds` | `3600` | How often the watcher loop wakes to **check** whether today's quota check is due. With the calendar-day gate, this is effectively "how stale a daily-rollover detection is allowed to be." 1 h is fine for the daily check; tighter just burns CPU on no-op ticks. |
-| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `last_check_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of "today done" on next tick. |
+| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `last_check_date` + `last_notify_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of "today done" + reset of "already notified today" on next tick. |
 | `mci_quota_below_gb` | `5.0` | Threshold in GB. Pop the warning only when the scraped value is strictly less than this. |
 | `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. (a) the Fetcher routes matching SMSes straight to `sms_del/` so the OTP doesn't pop a toast; (b) right after saving, it extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. |
 | `mci_otp_pattern` | `"Code:\\s*(\\d+)"` | Regex extracting the OTP digits from the SMS body. First capture group is the code. |
@@ -660,29 +660,54 @@ acting cadence, you typically get one line per day; the tray-menu
 the threshold drops, all readings (above and below threshold) still
 land in the log; the threshold only gates the popup.
 
-### The popup
+### Notifications
 
-Bottom-right Tk popup using the same stacking slot system as the SMS
-toasts, so a quota warning can appear alongside an SMS toast without
-overlapping:
+Three popup variants, all bottom-right Tk windows stacking through the
+same `TOAST_SLOTS` system as the SMS toasts (so they sit alongside
+each other instead of overlapping):
 
-- **Orange accent bar** (vs the SMS toast's blue) — visually
-  separable at a glance.
-- **Header**: `Internet quota low`.
-- **Body**: `Internet quota is low: <N.NN> GB remaining.`
-- **One button**: Dismiss.
+| Kind | Accent | Header | Body | Fires when |
+| --- | --- | --- | --- | --- |
+| info | green | `MCI quota update` | `Remaining quota: <N.NN> GB.` | Successful fetch, when the attempt was flagged notify-worthy (manual trigger OR first auto-tick of the day) AND value is at or above threshold. |
+| warning | orange | `Internet quota low` | `Internet quota is low: <N.NN> GB remaining.` | Successful fetch, value is **below** `mci_quota_below_gb`. Bypasses the once-per-day cap — every below-threshold reading fires, since the warning is more urgent than the daily gate. |
+| error | red | `MCI quota fetch failed` | error message (truncated to ~240 chars; full text in the log) | Auth or fetch failure on a notify-worthy attempt. Same once-per-day cap as info: an hours-long outage still pops only one error popup per day from the auto path. Manual clicks always notify. |
 
-The popup is **deferred under DND / Focus Assist / fullscreen** —
-same gating as the SMS toasts. A separate `QuotaWarner` thread
-drains the FIFO when Windows starts accepting notifications again,
-so a below-threshold scrape mid-game queues a warning that appears
-as soon as you exit fullscreen.
+All three pop **one button** (Dismiss) and are deferred under DND /
+Focus Assist / fullscreen — the `QuotaWarner` thread drains its FIFO
+when Windows starts accepting notifications again, so a below-
+threshold scrape mid-game queues a warning that appears as soon as
+you exit fullscreen.
 
-No dedupe and no per-day cap: every below-threshold scrape enqueues
-a fresh popup. With the daily acting cadence that's at most one
-popup per day from the auto path; manual *Check MCI quota* clicks
-add their own. In practice the quota only crosses the threshold
-once per billing cycle so this rarely matters.
+### When notifications fire — the once-per-day rule
+
+The MCI watcher tracks a `last_notify_date` field in `mci_state.json`
+to suppress popup-spam during multi-hour outages while still
+guaranteeing the user sees at least one quota update per day:
+
+- **Manual tick (tray menu *Check MCI quota*)**: always flagged
+  notify-worthy. Every click gives the user immediate feedback.
+- **Auto tick (new local calendar day)**: flagged notify-worthy
+  iff `today != last_notify_date`. So the first auto attempt of each
+  day notifies on its outcome (success → green info popup, failure →
+  red error popup, below threshold → orange warning). Subsequent
+  same-day retries — which only happen if the first attempt errored
+  and `last_check_date` hasn't advanced — go silent (logged only).
+- After enqueuing any popup, `last_notify_date` is stamped to today
+  so further auto-attempts that day stay silent.
+- The below-threshold warning bypasses this gate entirely: every
+  below-threshold scrape pops, regardless of `last_notify_date`.
+  Rationale: the threshold is rarely crossed (typically once per
+  billing cycle); spam isn't a realistic worry.
+
+Worked examples (auto tick hourly, manual click whenever):
+
+| Scenario | Day 1 popups |
+| --- | --- |
+| Healthy day, quota above threshold | 1 info popup (first auto tick of the day) |
+| Healthy day, quota below threshold | 1 warning popup (auto, threshold-driven) |
+| MCI down all day | 1 error popup (first auto tick); subsequent hourly retries silent |
+| MCI down then recovers same day | 1 error popup. Recovery is silent same-day; tomorrow's auto tick will pop an info popup confirming health. To see status sooner, click *Check MCI quota*. |
+| User clicks *Check MCI quota* 5 times | 5 info popups (manual always notifies) |
 
 ### Tray menu — `Check MCI quota`
 
@@ -1248,13 +1273,13 @@ The log writer rolls over at midnight (next entry opens
   `mci_enabled` is `false`. See [Remaining-quota check via MCI
   panel](#remaining-quota-check-via-mci-panel).
 - **QuotaWarner** — ticks every 15 s, but most ticks are no-ops.
-  Drains a FIFO of pending quota-low warnings (pushed by the
-  MciWatcher via `enqueue(gb)` after a below-threshold scrape) into
-  bottom-right Tk popups one at a time. Gated by
-  `accepts_notifications()` so it defers under DND. Started only
-  when `mci_enabled` is `true` (since MciWatcher is the sole
-  producer). See [Remaining-quota check via MCI
-  panel](#remaining-quota-check-via-mci-panel).
+  Drains a FIFO of MCI quota notifications (info / warning / error;
+  pushed by the MciWatcher via `enqueue_info(gb)` / `enqueue_warning(gb)`
+  / `enqueue_error(msg)`) into bottom-right Tk popups one at a time.
+  Gated by `accepts_notifications()` so it defers under DND. Started
+  only when `mci_enabled` is `true` (since MciWatcher is the sole
+  producer). See [Notifications](#notifications) for the popup variants
+  and gating rules.
 - **TelinaWatcher** — every `telina_interval_seconds` (1800 s = 30 min
   default), logs in to the Telina hub via GraphQL, fetches the 5
   most-recent CDR rows from the PBX panel via tRPC, diffs by `cuid`
