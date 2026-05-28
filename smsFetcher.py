@@ -2748,6 +2748,13 @@ class MciClient:
             self._extra[key] = value
             self._save_state_unlocked()
 
+    def del_extra(self, key: str):
+        """Remove an extra and persist. No-op if the key isn't there."""
+        with self._state_lock:
+            if key in self._extra:
+                self._extra.pop(key)
+                self._save_state_unlocked()
+
     def clear_session(self):
         """Drop cookies/bearer (in memory) and persist the cleared
         state. Called when the server returns 401/403 on a quota GET —
@@ -2981,12 +2988,22 @@ class MciWatcher:
         # the current auth/fetch attempt should pop a user-facing
         # notification. Set by tick() before each acting attempt — true
         # on manual trigger, or on auto attempts when today != the
-        # persisted ``last_notify_date`` (i.e. we haven't already
-        # notified the user once today). Reset to false after any popup
-        # is enqueued. Sticky across the async OTP-wait window: if tick
-        # set it true and an OTP later arrives, the deferred outcome
-        # still notifies.
+        # persisted ``notify_date_<slot>`` (i.e. we haven't already
+        # notified the user once today for this slot). Reset to false
+        # after any popup is enqueued. Sticky across the async OTP-wait
+        # window: if tick set it true and an OTP later arrives, the
+        # deferred outcome still notifies.
         self._pending_notify = False
+        # Which scheduling slot ("early" or "evening") the current
+        # auth/fetch attempt belongs to. Set by tick() before
+        # _try_fetch_or_request_otp; read by _on_quota_success and
+        # _notify_error so they update the right per-slot
+        # check_date_* / notify_date_* keys. Survives across the async
+        # OTP-wait window (in memory only).
+        self._current_slot: "str | None" = None
+        # One-shot migration of pre-slot state keys (from the version
+        # before two daily fetches).
+        self._migrate_old_state()
 
     def stop(self):
         self._stop.set()
@@ -3021,21 +3038,28 @@ class MciWatcher:
                 return None
 
     def _next_wake_seconds(self) -> float:
-        """Wake at min(``mci_interval_seconds``, time-until-next-scheduled-
-        fetch-time). Mirrors UsageTracker._next_wake_seconds — the
-        interval is an upper bound, and the scheduled time gives us a
-        precise tick within seconds of the configured wall-clock."""
+        """Wake at the minimum of: ``mci_interval_seconds`` (upper
+        bound), the time until the next local midnight (so the early
+        slot fires at 00:00:01), and the time until the next
+        ``mci_fetch_time`` (so the evening slot fires within ~1 s of
+        the configured wall-clock). Same precision-tick pattern as
+        ``UsageTracker._next_wake_seconds``."""
         interval = float(self.cfg.get("mci_interval_seconds", 3600))
-        if self._fetch_time is None:
-            return interval
         now = datetime.now()
-        today_target = datetime.combine(now.date(), self._fetch_time)
-        if today_target <= now:
-            target = today_target + timedelta(days=1)
-        else:
-            target = today_target
-        until_target = (target - now).total_seconds() + 1.0
-        return max(1.0, min(interval, until_target))
+        candidates = [interval]
+        # Next local midnight, +1 s, for the early slot.
+        next_midnight = datetime.combine(
+            now.date() + timedelta(days=1), dtime.min,
+        )
+        candidates.append((next_midnight - now).total_seconds() + 1.0)
+        # Next fetch_time, +1 s, for the evening slot.
+        if self._fetch_time is not None:
+            today_target = datetime.combine(now.date(), self._fetch_time)
+            target = today_target if today_target > now else (
+                today_target + timedelta(days=1)
+            )
+            candidates.append((target - now).total_seconds() + 1.0)
+        return max(1.0, min(candidates))
 
     def run(self):
         if self._stop.wait(self.STARTUP_GRACE_SECONDS):
@@ -3051,25 +3075,68 @@ class MciWatcher:
                 self.logger.error(f"mci: tick error: {e}", exc_info=True)
             self._wake.wait(self._next_wake_seconds())
 
-    # ---- date tracking ----
+    # ---- slot / date tracking ----
+
+    SLOT_EARLY = "early"
+    SLOT_EVENING = "evening"
 
     @staticmethod
     def _today_str() -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
-    def _last_check_date(self) -> "str | None":
-        v = self.client.get_extra("last_check_date")
+    def _slot_for_now(self, now: datetime) -> str:
+        """Which window the current local clock falls in.
+        ``[00:00, mci_fetch_time)`` is the *early* window (caught up on
+        new-day detection at midnight or app start); ``[mci_fetch_time,
+        24:00)`` is the *evening* window. With ``mci_fetch_time`` empty
+        / unset, the whole day is treated as ``evening`` — i.e. the
+        early slot is disabled."""
+        if self._fetch_time is None:
+            return self.SLOT_EVENING
+        return self.SLOT_EARLY if now.time() < self._fetch_time else self.SLOT_EVENING
+
+    def _check_date(self, slot: str) -> "str | None":
+        v = self.client.get_extra(f"check_date_{slot}")
         return str(v) if v else None
 
-    def _mark_today_done(self):
-        self.client.set_extra("last_check_date", self._today_str())
+    def _mark_check_date(self, slot: str):
+        self.client.set_extra(f"check_date_{slot}", self._today_str())
 
-    def _last_notify_date(self) -> "str | None":
-        v = self.client.get_extra("last_notify_date")
+    def _notify_date(self, slot: str) -> "str | None":
+        v = self.client.get_extra(f"notify_date_{slot}")
         return str(v) if v else None
 
-    def _mark_notified_today(self):
-        self.client.set_extra("last_notify_date", self._today_str())
+    def _mark_notify_date(self, slot: str):
+        self.client.set_extra(f"notify_date_{slot}", self._today_str())
+
+    def _migrate_old_state(self):
+        """One-shot translation of the pre-slot single-string keys
+        (``last_check_date`` / ``last_notify_date``, written by the
+        version that did one fetch per day) into the new per-slot keys.
+        Without migration, an upgrade would fire a spurious popup at
+        startup because the new keys are absent."""
+        old_check = self.client.get_extra("last_check_date")
+        if old_check and not self.client.get_extra(
+                f"check_date_{self.SLOT_EVENING}"):
+            for slot in (self.SLOT_EARLY, self.SLOT_EVENING):
+                self.client.set_extra(f"check_date_{slot}", str(old_check))
+            self.logger.info(
+                f"mci: migrated last_check_date={old_check} -> "
+                f"check_date_early / check_date_evening"
+            )
+        if old_check is not None:
+            self.client.del_extra("last_check_date")
+        old_notify = self.client.get_extra("last_notify_date")
+        if old_notify and not self.client.get_extra(
+                f"notify_date_{self.SLOT_EVENING}"):
+            for slot in (self.SLOT_EARLY, self.SLOT_EVENING):
+                self.client.set_extra(f"notify_date_{slot}", str(old_notify))
+            self.logger.info(
+                f"mci: migrated last_notify_date={old_notify} -> "
+                f"notify_date_early / notify_date_evening"
+            )
+        if old_notify is not None:
+            self.client.del_extra("last_notify_date")
 
     # ---- tick (auto or tray-triggered) ----
 
@@ -3079,33 +3146,30 @@ class MciWatcher:
             self._force_run = False
             now = datetime.now()
             today = self._today_str()
-            last = self._last_check_date()
-            if not force and last == today:
-                return
-            # Gate the auto path on the scheduled fetch time. If we
-            # haven't reached today's target wall-clock yet, skip.
-            # Catch-up works: starting the PC at 21:00 with today not
-            # done yet still fires (now >= scheduled), so a missed
-            # scheduled time during a power-off doesn't mean the day
-            # is lost — only the EXACT scheduled moment is. Manual
-            # triggers bypass this gate entirely.
-            if (not force and self._fetch_time is not None
-                    and now.time() < self._fetch_time):
-                return
-            # Decide whether the outcome of this attempt should notify.
-            # Manual: always. Auto: only if we haven't already notified
-            # the user today (prevents popup spam during multi-hour
-            # outages where the hourly tick keeps failing).
+            slot = self._slot_for_now(now)
             if force:
-                self.logger.info("mci: force-triggered tick")
+                # Manual trigger: bypass the slot-done gate; the slot
+                # name still drives notify-dedup so the regular auto
+                # tick today doesn't also pop. _pending_notify is
+                # always set to True for manual.
+                self._current_slot = slot
                 self._pending_notify = True
+                self.logger.info(f"mci: force-triggered tick (slot={slot})")
             else:
+                # Auto path: only fire if today's reading for this slot
+                # hasn't already been recorded. Each slot fires at most
+                # once per day within its window.
+                if self._check_date(slot) == today:
+                    return
+                self._current_slot = slot
                 self.logger.info(
-                    f"mci: scheduled tick (today={today}, "
-                    f"last_check_date={last}, "
-                    f"fetch_time={self._fetch_time})"
+                    f"mci: scheduled tick (today={today}, slot={slot}, "
+                    f"check_date={self._check_date(slot)})"
                 )
-                if self._last_notify_date() != today:
+                # Once-per-day-per-slot notification cap: an outage that
+                # keeps the hourly tick failing within the same slot
+                # window won't pop a popup more than once.
+                if self._notify_date(slot) != today:
                     self._pending_notify = True
             self._try_fetch_or_request_otp()
 
@@ -3210,9 +3274,12 @@ class MciWatcher:
     def _on_quota_success(self, result: dict):
         gb = result["unused_gb"]
         unit = result["unit"]
-        self.logger.info(f"mci: remaining quota = {gb:.2f} {unit}")
+        slot = self._current_slot or self.SLOT_EVENING
+        self.logger.info(
+            f"mci: remaining quota = {gb:.2f} {unit} (slot={slot})"
+        )
         self._log_quota_line(gb)
-        self._mark_today_done()
+        self._mark_check_date(slot)
         if self.quota_warner is None:
             self.logger.warning(
                 f"mci: {gb:.2f} GB read but no quota_warner is wired up"
@@ -3221,14 +3288,15 @@ class MciWatcher:
             return
         # Below-threshold readings always pop the orange warning,
         # regardless of pending_notify — the warning is more urgent
-        # than the "first-of-day" gate. Normal readings only pop the
-        # info popup when this attempt was flagged notify-worthy.
+        # than the "first-of-day-per-slot" gate. Normal readings only
+        # pop the info popup when this attempt was flagged
+        # notify-worthy.
         if gb < self.threshold_gb:
             self.quota_warner.enqueue_warning(gb)
-            self._mark_notified_today()
+            self._mark_notify_date(slot)
         elif self._pending_notify:
             self.quota_warner.enqueue_info(gb)
-            self._mark_notified_today()
+            self._mark_notify_date(slot)
         self._pending_notify = False
 
     # ---- error notification ----
@@ -3236,11 +3304,13 @@ class MciWatcher:
     def _notify_error(self, message: str):
         """Enqueue an error popup if this attempt was flagged
         notify-worthy by tick(). Always logs at the call sites.
-        Clears ``_pending_notify`` and stamps ``last_notify_date`` so
-        same-day retries don't spam."""
+        Clears ``_pending_notify`` and stamps the current slot's
+        ``notify_date_<slot>`` so same-day retries within that slot
+        don't spam."""
         if not self._pending_notify:
             return
         self._pending_notify = False
+        slot = self._current_slot or self.SLOT_EVENING
         if self.quota_warner is None:
             self.logger.warning(
                 f"mci: would notify error but no quota_warner is wired up: "
@@ -3248,7 +3318,7 @@ class MciWatcher:
             )
             return
         self.quota_warner.enqueue_error(message)
-        self._mark_notified_today()
+        self._mark_notify_date(slot)
 
     # ---- file log ----
 

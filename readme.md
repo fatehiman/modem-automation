@@ -9,9 +9,11 @@ short URL-only outbound SMS, so you receive it remotely. Also polls a
 [Telina hosted-PBX](https://hub.telina.ir/) account for new incoming calls
 and SMSes the caller numbers to a configured phone, so you get notified of
 calls that came in to your PBX while you were away. Reads the remaining
-internet quota off the [MCI customer panel](https://my.mci.ir/panel) **once
-per local calendar day** at a configured wall-clock time (default `19:30`,
-or on demand from the tray menu) via JWT Bearer auth refreshed by SMS-OTP. The flow is event-driven: if the session has
+internet quota off the [MCI customer panel](https://my.mci.ir/panel) **twice
+per local calendar day** — once on day-rollover (at 00:00, or on first
+detection if the PC was off) and once after the configured wall-clock
+time (default `19:30`); plus on demand from the tray menu. Auth is JWT
+Bearer, refreshed by SMS-OTP. The flow is event-driven: if the session has
 expired, the daily tick POSTs send-otp and returns immediately; whenever
 the Fetcher saves the resulting OTP SMS, it dispatches the digits to the
 MCI watcher to complete verification + deferred quota fetch. When the
@@ -580,38 +582,62 @@ entirely. If the OTP was already consumed by your browser before
 the Fetcher's poll cycle reached the SMS, our verify just fails
 quietly and the session state is left as-is.
 
-### Day tracking and scheduling
+### Day tracking and scheduling — two slots per day
 
-The watcher wakes on `min(mci_interval_seconds, time_until_next_fetch_time)`
-— the interval is an upper bound, and a precise wake one second
-after `mci_fetch_time` is scheduled for the exact daily tick. Same
-pattern as `UsageTracker._next_wake_seconds` does for the midnight
-boundary. A tick *acts* only when **all** these hold:
+The day is split into two **scheduling slots**, each firing
+independently at most once per local calendar day:
 
-- It's a new local calendar day (today's date ≠ persisted
-  `last_check_date`).
-- The current local wall-clock is at or past `mci_fetch_time`
-  (default `19:30`). An empty string in config disables the time
-  gate (act on the first tick of any new day).
+| Slot | Window | Intended trigger |
+| --- | --- | --- |
+| `early` | `[00:00, mci_fetch_time)` | Day-rollover refresh — catches when a new calendar day starts, even mid-morning. |
+| `evening` | `[mci_fetch_time, 24:00)` | End-of-day refresh — captures the late reading before the day ends. |
+
+Each slot persists its own state in `mci_state.json`:
+
+- `check_date_early` / `check_date_evening` — the date of the last
+  successful quota fetch for that slot.
+- `notify_date_early` / `notify_date_evening` — the date of the last
+  popup shown for that slot (for the once-per-day-per-slot
+  notification cap).
+
+The watcher wakes on `min(mci_interval_seconds, time_until_next_midnight, time_until_next_fetch_time)`
+— the interval is an upper bound, and the two precise wakes (one
+second past midnight, one second past `mci_fetch_time`) give us
+slot-boundary-accurate ticks. Same pattern as
+`UsageTracker._next_wake_seconds` does for the midnight rollover.
+
+A tick *acts* only when **either**:
+
+- The slot for the current wall-clock has `check_date_<slot> !=
+  today` (auto path). The slot is whichever window `now.time()`
+  falls in. A slot only fires within its own window — a missed early
+  slot (PC off all morning) is NOT caught up by the evening slot;
+  it's simply skipped for that day.
 - OR the user clicked *Check MCI quota* on the tray menu since the
   last tick (`_force_run` set by `trigger_now()`) — manual fires
-  ignore both the date and the time gate.
+  ignore both the slot-done and the slot-window gates.
 
-`last_check_date` is written **on success** (after a successful
+`check_date_<slot>` is written **on success** (after a successful
 quota read, regardless of whether OTP refresh was needed). A failure
 to fetch (network error, 5xx from MCI) leaves it unwritten, so the
-next tick retries — but a 401-then-send-otp leaves it unwritten too,
-deliberately: today isn't "done" until we actually read the quota.
-The deferred quota fetch from `on_otp_received` is what writes
-today's date.
+next tick within the same slot window retries — but a
+401-then-send-otp leaves it unwritten too, deliberately: today isn't
+"done" until we actually read the quota. The deferred quota fetch
+from `on_otp_received` is what writes today's date.
 
-**Catch-up on a missed scheduled time**: if the PC was off at 19:30
-and comes back online at 21:00, the first tick after startup grace
-sees `today != last_check_date` and `now >= fetch_time` → fires
-immediately. So the slot isn't "lost" if the moment passed during
-downtime. But a whole missed day (PC off 24+ h) is not back-filled:
-the next day's tick fires at *that* day's 19:30, with no
+**Catch-up within a slot window**: if the PC was off at midnight and
+boots at 09:00, the first tick after startup grace sees
+`now.time() < 19:30` → slot = early, `check_date_early` ≠ today
+→ fires. A whole missed day (PC off 24+ h) is not back-filled: the
+next day's ticks fire at midnight + 19:30 of *that* day, with no
 notification of the gap.
+
+**Disabling a slot**: setting `mci_fetch_time` to an empty string
+disables the early slot (the whole day becomes the evening window),
+reverting to single-daily-fetch behaviour. Migrations from the
+pre-slot version translate the old `last_check_date` /
+`last_notify_date` keys into both slots' values on first startup,
+so an upgrade doesn't fire spurious popups.
 
 This subsystem replaces an older USSD-based path (`*10*327#` → reply
 `0` → cancel via the modem panel, plus an SMS-receipt parser for
@@ -631,8 +657,8 @@ app no longer triggers it automatically. Set `mci_enabled` to
 | `mci_enabled` | `true` | Master toggle. Off → no MciWatcher thread, no QuotaWarner thread, no `Check MCI quota` tray item. |
 | `mci_username` | `"9133169571"` | 10-digit Iran mobile number registered with MCI (no leading 0, no country code — the panel expects it bare). |
 | `mci_interval_seconds` | `3600` | Upper bound on watcher loop wake interval. The actual wake is `min(this, time_until_next_fetch_time)`, so the daily tick lands within seconds of `mci_fetch_time`. Used as a fallback wake when no scheduled time is set. |
-| `mci_fetch_time` | `"19:30"` | Wall-clock time (HH:MM, local) for the daily auto fetch. Empty string disables the time gate (acts on first tick of any new day). Catch-up: if the PC was off at the scheduled time, the next tick after startup still fires (provided we're past today's target). |
-| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `last_check_date` + `last_notify_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of "today done" + reset of "already notified today" on next tick. |
+| `mci_fetch_time` | `"19:30"` | Wall-clock time (HH:MM, local) that splits the day into early `[00:00, mci_fetch_time)` and evening `[mci_fetch_time, 24:00)` slots — see [Day tracking and scheduling](#day-tracking-and-scheduling--two-slots-per-day). Empty string collapses the day into a single evening slot (one daily fetch). Catch-up: a slot fires on first tick within its window even if the slot's natural moment was missed during PC downtime. |
+| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `check_date_<slot>` + `notify_date_<slot>` (one of each per slot: early, evening) are persisted between runs. Delete the file to force a fresh OTP login + reset of both slots' "today done" + "already notified today" on next tick. |
 | `mci_quota_below_gb` | `5.0` | Threshold in GB. Pop the warning only when the scraped value is strictly less than this. |
 | `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. (a) the Fetcher routes matching SMSes straight to `sms_del/` so the OTP doesn't pop a toast; (b) right after saving, it extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. |
 | `mci_otp_pattern` | `"Code:\\s*(\\d+)"` | Regex extracting the OTP digits from the SMS body. First capture group is the code. |
@@ -695,35 +721,38 @@ when Windows starts accepting notifications again, so a below-
 threshold scrape mid-game queues a warning that appears as soon as
 you exit fullscreen.
 
-### When notifications fire — the once-per-day rule
+### When notifications fire — the once-per-slot-per-day rule
 
-The MCI watcher tracks a `last_notify_date` field in `mci_state.json`
-to suppress popup-spam during multi-hour outages while still
-guaranteeing the user sees at least one quota update per day:
+Each of the two scheduling slots gets its own notification quota.
+The watcher tracks `notify_date_early` and `notify_date_evening`
+separately in `mci_state.json`:
 
 - **Manual tick (tray menu *Check MCI quota*)**: always flagged
   notify-worthy. Every click gives the user immediate feedback.
-- **Auto tick (new local calendar day)**: flagged notify-worthy
-  iff `today != last_notify_date`. So the first auto attempt of each
-  day notifies on its outcome (success → green info popup, failure →
-  red error popup, below threshold → orange warning). Subsequent
-  same-day retries — which only happen if the first attempt errored
-  and `last_check_date` hasn't advanced — go silent (logged only).
-- After enqueuing any popup, `last_notify_date` is stamped to today
-  so further auto-attempts that day stay silent.
-- The below-threshold warning bypasses this gate entirely: every
-  below-threshold scrape pops, regardless of `last_notify_date`.
+- **Auto tick (slot's window, slot not done)**: flagged
+  notify-worthy iff `today != notify_date_<slot>`. So the first auto
+  attempt of each slot per day pops on its outcome (success → green
+  info popup, failure → red error popup, below threshold → orange
+  warning). Subsequent same-day retries within the same slot —
+  which only happen if the first attempt errored and
+  `check_date_<slot>` hasn't advanced — go silent (logged only).
+- After enqueuing any popup, `notify_date_<slot>` is stamped to
+  today so further auto-attempts in that slot stay silent.
+- The below-threshold warning bypasses these gates entirely: every
+  below-threshold scrape pops, regardless of `notify_date_<slot>`.
   Rationale: the threshold is rarely crossed (typically once per
   billing cycle); spam isn't a realistic worry.
 
-Worked examples (auto tick hourly, manual click whenever):
+Worked examples (healthy = above threshold; below = orange warning):
 
 | Scenario | Day 1 popups |
 | --- | --- |
-| Healthy day, quota above threshold | 1 info popup (first auto tick of the day) |
-| Healthy day, quota below threshold | 1 warning popup (auto, threshold-driven) |
-| MCI down all day | 1 error popup (first auto tick); subsequent hourly retries silent |
-| MCI down then recovers same day | 1 error popup. Recovery is silent same-day; tomorrow's auto tick will pop an info popup confirming health. To see status sooner, click *Check MCI quota*. |
+| Healthy day, both slots succeed | 2 info popups — one at 00:00:01 (early), one at 19:30:01 (evening) |
+| Healthy day, quota below threshold | 2 warning popups (one per slot, threshold bypasses dedup) |
+| MCI down all day | 2 error popups (one per slot's first attempt); same-slot retries silent |
+| Early slot errors, evening succeeds | 1 error popup at 00:00, 1 info popup at 19:30 |
+| PC boots at 10:00, both healthy | 1 info popup at 10:00:20 (early slot catch-up), 1 info popup at 19:30:01 (evening) |
+| PC boots at 21:00, both healthy | 1 info popup at 21:00:20 (evening only — early slot's window was missed, no catch-up) |
 | User clicks *Check MCI quota* 5 times | 5 info popups (manual always notifies) |
 
 ### Tray menu — `Check MCI quota`
@@ -1273,11 +1302,13 @@ The log writer rolls over at midnight (next entry opens
   `sms_del/` retention sweep (every 6 h). State (per-SMS upload/sent
   timestamps, failure budget, pause-until) lives in
   `relay_state.json`.
-- **MciWatcher** — wakes on `min(mci_interval_seconds, time_until_mci_fetch_time)`
-  (default fetch time `19:30`); most ticks are no-ops. When the local
-  calendar date differs from `last_check_date` AND the wall-clock is
-  past `mci_fetch_time` (or the tray menu forced a run), GETs
-  `/api/unit/v1/packages/details`; on 401/403,
+- **MciWatcher** — wakes on `min(mci_interval_seconds, time_until_next_midnight, time_until_mci_fetch_time)`
+  (default fetch time `19:30`); most ticks are no-ops. The day is
+  split into two slots (`early` `[00:00, mci_fetch_time)` and
+  `evening` `[mci_fetch_time, 24:00)`); each slot fires at most once
+  per local calendar day within its own window. When the slot for
+  the current wall-clock hasn't yet fired today (or the tray menu
+  forced a run), GETs `/api/unit/v1/packages/details`; on 401/403,
   POSTs `send-otp` and returns immediately — no synchronous wait.
   Receives the OTP digits asynchronously via
   `on_otp_received(code)`, which the Fetcher calls when the SMS
