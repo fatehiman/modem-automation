@@ -99,6 +99,7 @@ DEFAULT_CONFIG = {
     "mci_enabled": True,
     "mci_username": "9133169571",
     "mci_interval_seconds": 3600,
+    "mci_fetch_time": "19:30",
     "mci_state_file": "mci_state.json",
     "mci_quota_below_gb": 5.0,
     "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
@@ -2938,6 +2939,7 @@ class MciWatcher:
     # tick (especially the Fetcher, which may already have an unread
     # OTP SMS from a previous run sitting in sms/).
     STARTUP_GRACE_SECONDS = 20
+    DEFAULT_FETCH_TIME = "19:30"   # HH:MM, local clock
 
     def __init__(self, cfg: dict, logger: logging.Logger,
                  quota_warner: "QuotaWarner | None"):
@@ -2951,6 +2953,11 @@ class MciWatcher:
         )
         self.threshold_gb = float(cfg.get("mci_quota_below_gb", 5.0))
         self.otp_wait_s = int(cfg.get("mci_otp_wait_seconds", 120))
+        # Daily auto-tick fires after this wall-clock time. Empty string
+        # in config = no time gate (act on first opportunity of the day).
+        self._fetch_time = self._parse_fetch_time(
+            str(cfg.get("mci_fetch_time", self.DEFAULT_FETCH_TIME))
+        )
         self.client = MciClient(
             username=str(cfg["mci_username"]),
             state_path=self.app / cfg["mci_state_file"],
@@ -2987,9 +2994,48 @@ class MciWatcher:
 
     def trigger_now(self):
         """Tray-menu manual fire — re-run the tick now even if today's
-        already done."""
+        already done or we're before the scheduled fetch time."""
         self._force_run = True
         self._wake.set()
+
+    def _parse_fetch_time(self, raw: str) -> "dtime | None":
+        """Parse ``"HH:MM"`` → ``datetime.time``. Empty string → None
+        (= no time gate, act on first opportunity of the day).
+        Falls back to the class default with a log warning on garbage
+        input."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            h, m = raw.split(":", 1)
+            return dtime(int(h), int(m))
+        except (ValueError, AttributeError) as e:
+            self.logger.warning(
+                f"mci_fetch_time {raw!r} unparseable ({e}); "
+                f"falling back to default {self.DEFAULT_FETCH_TIME}"
+            )
+            try:
+                h, m = self.DEFAULT_FETCH_TIME.split(":", 1)
+                return dtime(int(h), int(m))
+            except Exception:
+                return None
+
+    def _next_wake_seconds(self) -> float:
+        """Wake at min(``mci_interval_seconds``, time-until-next-scheduled-
+        fetch-time). Mirrors UsageTracker._next_wake_seconds — the
+        interval is an upper bound, and the scheduled time gives us a
+        precise tick within seconds of the configured wall-clock."""
+        interval = float(self.cfg.get("mci_interval_seconds", 3600))
+        if self._fetch_time is None:
+            return interval
+        now = datetime.now()
+        today_target = datetime.combine(now.date(), self._fetch_time)
+        if today_target <= now:
+            target = today_target + timedelta(days=1)
+        else:
+            target = today_target
+        until_target = (target - now).total_seconds() + 1.0
+        return max(1.0, min(interval, until_target))
 
     def run(self):
         if self._stop.wait(self.STARTUP_GRACE_SECONDS):
@@ -3003,7 +3049,7 @@ class MciWatcher:
                 self.tick()
             except Exception as e:
                 self.logger.error(f"mci: tick error: {e}", exc_info=True)
-            self._wake.wait(float(self.cfg["mci_interval_seconds"]))
+            self._wake.wait(self._next_wake_seconds())
 
     # ---- date tracking ----
 
@@ -3031,9 +3077,20 @@ class MciWatcher:
         with self._client_lock:
             force = self._force_run
             self._force_run = False
+            now = datetime.now()
             today = self._today_str()
             last = self._last_check_date()
             if not force and last == today:
+                return
+            # Gate the auto path on the scheduled fetch time. If we
+            # haven't reached today's target wall-clock yet, skip.
+            # Catch-up works: starting the PC at 21:00 with today not
+            # done yet still fires (now >= scheduled), so a missed
+            # scheduled time during a power-off doesn't mean the day
+            # is lost — only the EXACT scheduled moment is. Manual
+            # triggers bypass this gate entirely.
+            if (not force and self._fetch_time is not None
+                    and now.time() < self._fetch_time):
                 return
             # Decide whether the outcome of this attempt should notify.
             # Manual: always. Auto: only if we haven't already notified
@@ -3044,7 +3101,9 @@ class MciWatcher:
                 self._pending_notify = True
             else:
                 self.logger.info(
-                    f"mci: daily tick (today={today}, last_check_date={last})"
+                    f"mci: scheduled tick (today={today}, "
+                    f"last_check_date={last}, "
+                    f"fetch_time={self._fetch_time})"
                 )
                 if self._last_notify_date() != today:
                     self._pending_notify = True

@@ -10,8 +10,8 @@ short URL-only outbound SMS, so you receive it remotely. Also polls a
 and SMSes the caller numbers to a configured phone, so you get notified of
 calls that came in to your PBX while you were away. Reads the remaining
 internet quota off the [MCI customer panel](https://my.mci.ir/panel) **once
-per local calendar day** (or on demand from the tray menu) via JWT Bearer
-auth refreshed by SMS-OTP. The flow is event-driven: if the session has
+per local calendar day** at a configured wall-clock time (default `19:30`,
+or on demand from the tray menu) via JWT Bearer auth refreshed by SMS-OTP. The flow is event-driven: if the session has
 expired, the daily tick POSTs send-otp and returns immediately; whenever
 the Fetcher saves the resulting OTP SMS, it dispatches the digits to the
 MCI watcher to complete verification + deferred quota fetch. When the
@@ -208,6 +208,7 @@ gives full control over click behavior and styling.
   "mci_enabled": true,
   "mci_username": "9133169571",
   "mci_interval_seconds": 3600,
+  "mci_fetch_time": "19:30",
   "mci_state_file": "mci_state.json",
   "mci_quota_below_gb": 5.0,
   "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
@@ -581,21 +582,36 @@ quietly and the session state is left as-is.
 
 ### Day tracking and scheduling
 
-The watcher wakes every `mci_interval_seconds` (default 3600 s = 1 h)
-but most ticks are no-ops. A tick *acts* only when **either**:
+The watcher wakes on `min(mci_interval_seconds, time_until_next_fetch_time)`
+— the interval is an upper bound, and a precise wake one second
+after `mci_fetch_time` is scheduled for the exact daily tick. Same
+pattern as `UsageTracker._next_wake_seconds` does for the midnight
+boundary. A tick *acts* only when **all** these hold:
 
 - It's a new local calendar day (today's date ≠ persisted
   `last_check_date`).
-- The user clicked *Check MCI quota* on the tray menu since the last
-  tick (`_force_run` flag set by `trigger_now()`).
+- The current local wall-clock is at or past `mci_fetch_time`
+  (default `19:30`). An empty string in config disables the time
+  gate (act on the first tick of any new day).
+- OR the user clicked *Check MCI quota* on the tray menu since the
+  last tick (`_force_run` set by `trigger_now()`) — manual fires
+  ignore both the date and the time gate.
 
 `last_check_date` is written **on success** (after a successful
 quota read, regardless of whether OTP refresh was needed). A failure
 to fetch (network error, 5xx from MCI) leaves it unwritten, so the
-next hourly tick retries — but a 401-then-send-otp leaves it
-unwritten too, deliberately: today isn't "done" until we actually
-read the quota. The deferred quota fetch from `on_otp_received` is
-what writes today's date.
+next tick retries — but a 401-then-send-otp leaves it unwritten too,
+deliberately: today isn't "done" until we actually read the quota.
+The deferred quota fetch from `on_otp_received` is what writes
+today's date.
+
+**Catch-up on a missed scheduled time**: if the PC was off at 19:30
+and comes back online at 21:00, the first tick after startup grace
+sees `today != last_check_date` and `now >= fetch_time` → fires
+immediately. So the slot isn't "lost" if the moment passed during
+downtime. But a whole missed day (PC off 24+ h) is not back-filled:
+the next day's tick fires at *that* day's 19:30, with no
+notification of the gap.
 
 This subsystem replaces an older USSD-based path (`*10*327#` → reply
 `0` → cancel via the modem panel, plus an SMS-receipt parser for
@@ -614,7 +630,8 @@ app no longer triggers it automatically. Set `mci_enabled` to
 | --- | ------- | ------- |
 | `mci_enabled` | `true` | Master toggle. Off → no MciWatcher thread, no QuotaWarner thread, no `Check MCI quota` tray item. |
 | `mci_username` | `"9133169571"` | 10-digit Iran mobile number registered with MCI (no leading 0, no country code — the panel expects it bare). |
-| `mci_interval_seconds` | `3600` | How often the watcher loop wakes to **check** whether today's quota check is due. With the calendar-day gate, this is effectively "how stale a daily-rollover detection is allowed to be." 1 h is fine for the daily check; tighter just burns CPU on no-op ticks. |
+| `mci_interval_seconds` | `3600` | Upper bound on watcher loop wake interval. The actual wake is `min(this, time_until_next_fetch_time)`, so the daily tick lands within seconds of `mci_fetch_time`. Used as a fallback wake when no scheduled time is set. |
+| `mci_fetch_time` | `"19:30"` | Wall-clock time (HH:MM, local) for the daily auto fetch. Empty string disables the time gate (acts on first tick of any new day). Catch-up: if the PC was off at the scheduled time, the next tick after startup still fires (provided we're past today's target). |
 | `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `last_check_date` + `last_notify_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of "today done" + reset of "already notified today" on next tick. |
 | `mci_quota_below_gb` | `5.0` | Threshold in GB. Pop the warning only when the scraped value is strictly less than this. |
 | `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. (a) the Fetcher routes matching SMSes straight to `sms_del/` so the OTP doesn't pop a toast; (b) right after saving, it extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. |
@@ -1256,10 +1273,11 @@ The log writer rolls over at midnight (next entry opens
   `sms_del/` retention sweep (every 6 h). State (per-SMS upload/sent
   timestamps, failure budget, pause-until) lives in
   `relay_state.json`.
-- **MciWatcher** — wakes every `mci_interval_seconds` (3600 s = 1 h
-  default); most ticks are no-ops. When the local calendar date
-  differs from the persisted `last_check_date` (or the tray menu
-  forced a run), GETs `/api/unit/v1/packages/details`; on 401/403,
+- **MciWatcher** — wakes on `min(mci_interval_seconds, time_until_mci_fetch_time)`
+  (default fetch time `19:30`); most ticks are no-ops. When the local
+  calendar date differs from `last_check_date` AND the wall-clock is
+  past `mci_fetch_time` (or the tray menu forced a run), GETs
+  `/api/unit/v1/packages/details`; on 401/403,
   POSTs `send-otp` and returns immediately — no synchronous wait.
   Receives the OTP digits asynchronously via
   `on_otp_received(code)`, which the Fetcher calls when the SMS
