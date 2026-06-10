@@ -18,6 +18,7 @@ import queue
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -98,10 +99,23 @@ DEFAULT_CONFIG = {
     "forward_regex_replacements": [],
     "mci_enabled": True,
     "mci_username": "9133169571",
+    # Normal poll cadence (seconds). Accelerates to
+    # mci_fast_poll_interval_seconds once today's usage reaches
+    # mci_fast_poll_usage_gb.
     "mci_interval_seconds": 3600,
-    "mci_fetch_time": "19:30",
+    "mci_fast_poll_interval_seconds": 600,
     "mci_state_file": "mci_state.json",
     "mci_quota_below_gb": 5.0,
+    # Daily usage-cap model. Usage today = day-begin remaining baseline
+    # minus current remaining quota. day-begin.bat runs at the first
+    # poll of each day; mci-quota-reached.bat runs once when today's
+    # usage hits mci_quota_reached_usage_gb (then polling pauses until
+    # the next day). Paths are resolved against the app dir if relative.
+    "mci_daily_limit_gb": 5.0,
+    "mci_quota_reached_usage_gb": 4.9,
+    "mci_fast_poll_usage_gb": 4.0,
+    "mci_day_begin_bat": "day-begin.bat",
+    "mci_quota_reached_bat": "mci-quota-reached.bat",
     "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
     "mci_otp_pattern": r"Code:\s*(\d+)",
     "mci_otp_wait_seconds": 120,
@@ -2546,6 +2560,24 @@ class QuotaWarner:
             f"quota: enqueued error: {message!r}",
         )
 
+    def enqueue_cap(self, usage_gb: float, remaining_gb: float,
+                    limit_gb: float):
+        """Daily usage-cap reached. Distinct from the low-remaining
+        warning: this fires when today's *usage* (day-begin baseline
+        minus current remaining) crosses the configured cap, right after
+        the MciWatcher launches mci-quota-reached.bat."""
+        self._enqueue(
+            {
+                "kind": "cap",
+                "value": {
+                    "usage": float(usage_gb),
+                    "remaining": float(remaining_gb),
+                    "limit": float(limit_gb),
+                },
+            },
+            f"quota: enqueued daily-cap (usage={usage_gb:.2f} GB)",
+        )
+
     def _on_ack(self):
         # Tk-thread callback: popup just closed. Allow the next tick to
         # show another one (if any are queued and DND is clear).
@@ -2884,58 +2916,58 @@ class MciClient:
 
 
 class MciWatcher:
-    """Reads the MCI panel's remaining-quota figure once per local
-    calendar day (auto trigger) or on demand from the tray menu. Auth
-    is JWT Bearer, refreshed via SMS-OTP whenever the server returns
-    401/403.
+    """Polls the MCI panel's remaining-quota figure on an adaptive
+    cadence and enforces a per-day usage cap with two batch-file hooks.
 
-    The flow is **asynchronous**, decoupling "I need quota" from "OTP
+    **Daily usage model** (usage = drop from a day-begin baseline, since
+    the panel only reports a large rolling ``remaining`` figure, not
+    daily usage):
+
+    1. **Day begin** — the first tick of each local calendar day fetches
+       the remaining quota, stores it as the day's baseline
+       (``day_begin_quota_gb`` + ``day_begin_date``) and launches the
+       configured ``mci_day_begin_bat``. Usage for the rest of the day is
+       ``baseline − current_remaining`` (clamped at 0 if a top-up raises
+       the remaining figure).
+
+    2. **Adaptive polling** — normally every ``mci_interval_seconds``
+       (default 3600 s). Once today's usage reaches
+       ``mci_fast_poll_usage_gb`` (default 4.0 GB) polling accelerates to
+       ``mci_fast_poll_interval_seconds`` (default 600 s) so the cap is
+       caught promptly.
+
+    3. **Cap reached** — when today's usage reaches
+       ``mci_quota_reached_usage_gb`` (default 4.9 GB) the watcher
+       launches ``mci_quota_reached_bat`` exactly once (``reached_date``
+       guard) and then pauses polling until the next day-begin.
+
+    **Auth** is JWT Bearer, refreshed via SMS-OTP whenever the panel
+    returns 401/403 — an async flow decoupling "I need quota" from "OTP
     arrived":
 
-    1. ``tick()`` checks today's date against ``last_check_date``
-       (persisted in mci_state.json). If today is already done and the
-       caller isn't forcing, no-op. Otherwise call ``fetch_quota``:
+      - ``fetch_quota`` HTTP 200 → success path (log, baseline/usage,
+        cap-check, notifications).
+      - HTTP 401/403 → clear cookies/bearer, set ``_pending_quota_check``,
+        POST send-otp (subject to a per-OTP cooldown) and return; the
+        loop stays free.
+      - ``on_otp_received(code)`` (called from the Fetcher thread when an
+        OTP SMS lands) verifies and, if a check was pending, runs the
+        deferred fetch.
+      - ``trigger_now()`` (tray *Check MCI quota*) forces an immediate
+        re-run, bypassing the cap-pause and the once-per-day notify gate.
 
-         - HTTP 200 → success path (log reading, threshold-check, mark
-           today done).
-         - HTTP 401/403 → clear cookies/bearer, set the in-memory
-           ``_pending_quota_check`` flag, POST send-otp (subject to a
-           per-OTP cooldown), and **return immediately**. No
-           synchronous wait for the SMS — the loop is free for other
-           work.
-         - Any other error → log, return (no state change, retry next
-           tick).
+    Cooldown: after a successful send-otp the watcher won't re-send for
+    ``mci_otp_wait_seconds`` (default 120 s); reset on successful verify.
 
-    2. ``on_otp_received(code)`` is called from the Fetcher thread
-       whenever an SMS matching ``mci_otp_match_substring`` is saved
-       (this includes OTPs we triggered AND spontaneous ones from the
-       user logging in to mci.ir's website themselves). We POST
-       verify with the digits; on success:
-
-         - If ``_pending_quota_check`` was set, run the deferred
-           ``fetch_quota`` now and mark today done.
-         - Otherwise just log "session refreshed opportunistically" —
-           the user's manual browser login left us with fresh auth for
-           the next scheduled check.
-
-       If verify fails (e.g. the OTP was already consumed by the
-       user's browser before we got there), the failure is logged and
-       the session state is left as-is.
-
-    3. ``trigger_now()`` (tray menu's *Check MCI quota*) sets the
-       ``_force_run`` flag and wakes the loop, so the next ``tick()``
-       re-runs even if today is already done.
-
-    Cooldown: after a successful send-otp, the watcher won't re-send
-    for ``mci_otp_wait_seconds`` (default 120 s). Prevents OTP-burning
-    when an SMS gets stuck in transit and the daily tick comes around
-    again. Reset to zero on successful verify.
-
-    State persisted to ``mci_state.json``: cookies (a CDN cookie only,
-    not auth), bearer (the JWT), ``last_check_date`` (YYYY-MM-DD).
-    The in-memory pending-check flag and cooldown timestamp don't
-    survive a restart — after a restart the next tick will try
-    fetch_quota afresh and re-enter the OTP flow if needed.
+    State persisted to ``mci_state.json`` extras:
+      - ``day_begin_date`` (YYYY-MM-DD) / ``day_begin_quota_gb`` (float)
+        — today's baseline.
+      - ``reached_date`` (YYYY-MM-DD) — the day the cap fired (also the
+        polling-paused marker).
+      - ``notify_date`` (YYYY-MM-DD) — once-per-day notification cap.
+    In-memory only (don't survive restart, which is fine): the
+    pending-OTP / pending-day-begin / pending-notify flags, the OTP
+    cooldown timestamp, and the last computed usage.
 
     Skipped entirely when ``mci_enabled`` is false. Errors inside
     tick() and on_otp_received() are caught and logged, so a broken
@@ -2946,7 +2978,6 @@ class MciWatcher:
     # tick (especially the Fetcher, which may already have an unread
     # OTP SMS from a previous run sitting in sms/).
     STARTUP_GRACE_SECONDS = 20
-    DEFAULT_FETCH_TIME = "19:30"   # HH:MM, local clock
 
     def __init__(self, cfg: dict, logger: logging.Logger,
                  quota_warner: "QuotaWarner | None"):
@@ -2958,12 +2989,25 @@ class MciWatcher:
             self.app / cfg["usage_total_folder"]
             / cfg["mci_quota_log_filename"]
         )
-        self.threshold_gb = float(cfg.get("mci_quota_below_gb", 5.0))
+        # Daily usage-cap parameters.
+        self.daily_limit_gb = float(cfg.get("mci_daily_limit_gb", 5.0))
+        self.reached_usage_gb = float(
+            cfg.get("mci_quota_reached_usage_gb", 4.9)
+        )
+        self.fast_usage_gb = float(cfg.get("mci_fast_poll_usage_gb", 4.0))
+        # Below this *remaining* figure pop the orange low-quota warning
+        # (separate concern from the daily-usage cap).
+        self.warn_below_gb = float(cfg.get("mci_quota_below_gb", 5.0))
+        # Poll cadence (seconds): normal, and fast once near the cap.
+        self.normal_interval_s = float(cfg.get("mci_interval_seconds", 3600))
+        self.fast_interval_s = float(
+            cfg.get("mci_fast_poll_interval_seconds", 600)
+        )
         self.otp_wait_s = int(cfg.get("mci_otp_wait_seconds", 120))
-        # Daily auto-tick fires after this wall-clock time. Empty string
-        # in config = no time gate (act on first opportunity of the day).
-        self._fetch_time = self._parse_fetch_time(
-            str(cfg.get("mci_fetch_time", self.DEFAULT_FETCH_TIME))
+        # Batch-file hooks (resolved against the app dir if relative).
+        self.day_begin_bat = str(cfg.get("mci_day_begin_bat", "") or "")
+        self.quota_reached_bat = str(
+            cfg.get("mci_quota_reached_bat", "") or ""
         )
         self.client = MciClient(
             username=str(cfg["mci_username"]),
@@ -2986,24 +3030,20 @@ class MciWatcher:
         self._force_run = False
         # Whether the next decisive outcome (success or final error) of
         # the current auth/fetch attempt should pop a user-facing
-        # notification. Set by tick() before each acting attempt — true
-        # on manual trigger, or on auto attempts when today != the
-        # persisted ``notify_date_<slot>`` (i.e. we haven't already
-        # notified the user once today for this slot). Reset to false
-        # after any popup is enqueued. Sticky across the async OTP-wait
-        # window: if tick set it true and an OTP later arrives, the
-        # deferred outcome still notifies.
+        # notification. Set by tick() — true on manual trigger, or on
+        # auto attempts when today != the persisted ``notify_date`` (so
+        # the hourly poll notifies at most once per day). Reset after any
+        # popup is enqueued. Sticky across the async OTP-wait window.
         self._pending_notify = False
-        # Which scheduling slot ("early" or "evening") the current
-        # auth/fetch attempt belongs to. Set by tick() before
-        # _try_fetch_or_request_otp; read by _on_quota_success and
-        # _notify_error so they update the right per-slot
-        # check_date_* / notify_date_* keys. Survives across the async
-        # OTP-wait window (in memory only).
-        self._current_slot: "str | None" = None
-        # One-shot migration of pre-slot state keys (from the version
-        # before two daily fetches).
-        self._migrate_old_state()
+        # Set by tick() on the first tick of a new calendar day; consumed
+        # by _on_quota_success to establish today's baseline and launch
+        # the day-begin hook once the fresh reading is in hand.
+        self._pending_day_begin = False
+        # Last computed usage (GB) — drives the adaptive wake interval.
+        # -1 = unknown (no successful reading yet this run).
+        self._last_usage_gb = -1.0
+        # Drop stale keys from the previous slot-based scheduler.
+        self._cleanup_old_state()
 
     def stop(self):
         self._stop.set()
@@ -3015,51 +3055,29 @@ class MciWatcher:
         self._force_run = True
         self._wake.set()
 
-    def _parse_fetch_time(self, raw: str) -> "dtime | None":
-        """Parse ``"HH:MM"`` → ``datetime.time``. Empty string → None
-        (= no time gate, act on first opportunity of the day).
-        Falls back to the class default with a log warning on garbage
-        input."""
-        raw = (raw or "").strip()
-        if not raw:
-            return None
-        try:
-            h, m = raw.split(":", 1)
-            return dtime(int(h), int(m))
-        except (ValueError, AttributeError) as e:
-            self.logger.warning(
-                f"mci_fetch_time {raw!r} unparseable ({e}); "
-                f"falling back to default {self.DEFAULT_FETCH_TIME}"
-            )
-            try:
-                h, m = self.DEFAULT_FETCH_TIME.split(":", 1)
-                return dtime(int(h), int(m))
-            except Exception:
-                return None
-
     def _next_wake_seconds(self) -> float:
-        """Wake at the minimum of: ``mci_interval_seconds`` (upper
-        bound), the time until the next local midnight (so the early
-        slot fires at 00:00:01), and the time until the next
-        ``mci_fetch_time`` (so the evening slot fires within ~1 s of
-        the configured wall-clock). Same precision-tick pattern as
-        ``UsageTracker._next_wake_seconds``."""
-        interval = float(self.cfg.get("mci_interval_seconds", 3600))
+        """Adaptive cadence. Always wake at the next local midnight +1 s
+        so a new day's day-begin fires promptly. Otherwise:
+
+        - if today's cap already fired (``reached_date`` == today), poll
+          is paused — sleep until midnight only;
+        - else poll every ``mci_interval_seconds``, accelerating to
+          ``mci_fast_poll_interval_seconds`` once today's usage has
+          reached ``mci_fast_poll_usage_gb``.
+
+        Same precision-tick pattern as ``UsageTracker``."""
         now = datetime.now()
-        candidates = [interval]
-        # Next local midnight, +1 s, for the early slot.
         next_midnight = datetime.combine(
             now.date() + timedelta(days=1), dtime.min,
         )
-        candidates.append((next_midnight - now).total_seconds() + 1.0)
-        # Next fetch_time, +1 s, for the evening slot.
-        if self._fetch_time is not None:
-            today_target = datetime.combine(now.date(), self._fetch_time)
-            target = today_target if today_target > now else (
-                today_target + timedelta(days=1)
-            )
-            candidates.append((target - now).total_seconds() + 1.0)
-        return max(1.0, min(candidates))
+        secs_to_midnight = (next_midnight - now).total_seconds() + 1.0
+        # Cap reached for the day → idle until the new day begins.
+        if self.client.get_extra("reached_date") == self._today_str():
+            return max(1.0, secs_to_midnight)
+        interval = self.normal_interval_s
+        if self._last_usage_gb >= self.fast_usage_gb:
+            interval = self.fast_interval_s
+        return max(1.0, min(interval, secs_to_midnight))
 
     def run(self):
         if self._stop.wait(self.STARTUP_GRACE_SECONDS):
@@ -3075,68 +3093,52 @@ class MciWatcher:
                 self.logger.error(f"mci: tick error: {e}", exc_info=True)
             self._wake.wait(self._next_wake_seconds())
 
-    # ---- slot / date tracking ----
-
-    SLOT_EARLY = "early"
-    SLOT_EVENING = "evening"
+    # ---- date tracking / housekeeping ----
 
     @staticmethod
     def _today_str() -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
-    def _slot_for_now(self, now: datetime) -> str:
-        """Which window the current local clock falls in.
-        ``[00:00, mci_fetch_time)`` is the *early* window (caught up on
-        new-day detection at midnight or app start); ``[mci_fetch_time,
-        24:00)`` is the *evening* window. With ``mci_fetch_time`` empty
-        / unset, the whole day is treated as ``evening`` — i.e. the
-        early slot is disabled."""
-        if self._fetch_time is None:
-            return self.SLOT_EVENING
-        return self.SLOT_EARLY if now.time() < self._fetch_time else self.SLOT_EVENING
+    def _cleanup_old_state(self):
+        """Drop keys written by the previous slot-based scheduler so the
+        state file doesn't accrete dead fields after an upgrade."""
+        for k in (
+            "last_check_date", "last_notify_date",
+            "check_date_early", "check_date_evening",
+            "notify_date_early", "notify_date_evening",
+        ):
+            if self.client.get_extra(k) is not None:
+                self.client.del_extra(k)
 
-    def _check_date(self, slot: str) -> "str | None":
-        v = self.client.get_extra(f"check_date_{slot}")
-        return str(v) if v else None
-
-    def _mark_check_date(self, slot: str):
-        self.client.set_extra(f"check_date_{slot}", self._today_str())
-
-    def _notify_date(self, slot: str) -> "str | None":
-        v = self.client.get_extra(f"notify_date_{slot}")
-        return str(v) if v else None
-
-    def _mark_notify_date(self, slot: str):
-        self.client.set_extra(f"notify_date_{slot}", self._today_str())
-
-    def _migrate_old_state(self):
-        """One-shot translation of the pre-slot single-string keys
-        (``last_check_date`` / ``last_notify_date``, written by the
-        version that did one fetch per day) into the new per-slot keys.
-        Without migration, an upgrade would fire a spurious popup at
-        startup because the new keys are absent."""
-        old_check = self.client.get_extra("last_check_date")
-        if old_check and not self.client.get_extra(
-                f"check_date_{self.SLOT_EVENING}"):
-            for slot in (self.SLOT_EARLY, self.SLOT_EVENING):
-                self.client.set_extra(f"check_date_{slot}", str(old_check))
-            self.logger.info(
-                f"mci: migrated last_check_date={old_check} -> "
-                f"check_date_early / check_date_evening"
+    def _run_bat(self, label: str, path_str: str):
+        """Fire-and-forget launch of a configured batch file. Relative
+        paths resolve against the app dir. Missing/empty paths are logged
+        and skipped — never fatal (the watcher keeps polling)."""
+        path_str = (path_str or "").strip()
+        if not path_str:
+            self.logger.warning(
+                f"mci: {label} bat not configured (empty path); skipping"
             )
-        if old_check is not None:
-            self.client.del_extra("last_check_date")
-        old_notify = self.client.get_extra("last_notify_date")
-        if old_notify and not self.client.get_extra(
-                f"notify_date_{self.SLOT_EVENING}"):
-            for slot in (self.SLOT_EARLY, self.SLOT_EVENING):
-                self.client.set_extra(f"notify_date_{slot}", str(old_notify))
-            self.logger.info(
-                f"mci: migrated last_notify_date={old_notify} -> "
-                f"notify_date_early / notify_date_evening"
+            return
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = self.app / p
+        if not p.exists():
+            self.logger.error(
+                f"mci: {label} bat not found at {p}; skipping"
             )
-        if old_notify is not None:
-            self.client.del_extra("last_notify_date")
+            return
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", str(p)],
+                cwd=str(p.parent),
+                close_fds=True,
+            )
+            self.logger.info(f"mci: launched {label} bat: {p}")
+        except Exception as e:
+            self.logger.error(
+                f"mci: failed to launch {label} bat ({p}): {e}"
+            )
 
     # ---- tick (auto or tray-triggered) ----
 
@@ -3144,33 +3146,32 @@ class MciWatcher:
         with self._client_lock:
             force = self._force_run
             self._force_run = False
-            now = datetime.now()
             today = self._today_str()
-            slot = self._slot_for_now(now)
+            # First tick of a new calendar day (or first run ever): the
+            # upcoming fetch establishes today's baseline and runs the
+            # day-begin hook. A new day also implicitly clears yesterday's
+            # cap/notify gating (they key off the date).
+            new_day = self.client.get_extra("day_begin_date") != today
+            if new_day:
+                self._pending_day_begin = True
             if force:
-                # Manual trigger: bypass the slot-done gate; the slot
-                # name still drives notify-dedup so the regular auto
-                # tick today doesn't also pop. _pending_notify is
-                # always set to True for manual.
-                self._current_slot = slot
+                # Manual trigger: bypass the cap-pause and always notify.
                 self._pending_notify = True
-                self.logger.info(f"mci: force-triggered tick (slot={slot})")
+                self.logger.info("mci: force-triggered tick")
             else:
-                # Auto path: only fire if today's reading for this slot
-                # hasn't already been recorded. Each slot fires at most
-                # once per day within its window.
-                if self._check_date(slot) == today:
+                # Auto path: if today's cap already fired, polling is
+                # paused until the next day-begin — skip (a new day is
+                # never "already reached", so day-begin still runs).
+                if not new_day and \
+                        self.client.get_extra("reached_date") == today:
                     return
-                self._current_slot = slot
-                self.logger.info(
-                    f"mci: scheduled tick (today={today}, slot={slot}, "
-                    f"check_date={self._check_date(slot)})"
-                )
-                # Once-per-day-per-slot notification cap: an outage that
-                # keeps the hourly tick failing within the same slot
-                # window won't pop a popup more than once.
-                if self._notify_date(slot) != today:
+                # Once-per-day notification cap: an outage that keeps the
+                # hourly poll failing won't pop more than one popup/day.
+                if self.client.get_extra("notify_date") != today:
                     self._pending_notify = True
+                self.logger.info(
+                    f"mci: tick (today={today}, new_day={new_day})"
+                )
             self._try_fetch_or_request_otp()
 
     def _try_fetch_or_request_otp(self):
@@ -3268,35 +3269,86 @@ class MciWatcher:
                 )
                 return
             self._on_quota_success(result)
+            # This reading arrived asynchronously: the watcher loop sent
+            # send-otp in tick() and then computed its sleep from the
+            # PREVIOUS usage — so it may be parked for a full normal
+            # interval even though usage just crossed into fast-poll (or
+            # cap) territory. Wake it to reschedule against the fresh
+            # usage. The re-tick's GET reuses the session we just
+            # verified (this fetch returned 200), so it won't burn an OTP.
+            self._wake.set()
 
     # ---- success path ----
 
     def _on_quota_success(self, result: dict):
-        gb = result["unused_gb"]
+        remaining_gb = result["unused_gb"]
         unit = result["unit"]
-        slot = self._current_slot or self.SLOT_EVENING
-        self.logger.info(
-            f"mci: remaining quota = {gb:.2f} {unit} (slot={slot})"
-        )
-        self._log_quota_line(gb)
-        self._mark_check_date(slot)
-        if self.quota_warner is None:
-            self.logger.warning(
-                f"mci: {gb:.2f} GB read but no quota_warner is wired up"
+        today = self._today_str()
+        self.logger.info(f"mci: remaining quota = {remaining_gb:.2f} {unit}")
+        self._log_quota_line(remaining_gb)
+
+        # --- day-begin: establish today's baseline + run the hook once ---
+        if self._pending_day_begin:
+            self._pending_day_begin = False
+            self.client.set_extra("day_begin_quota_gb", remaining_gb)
+            self.client.set_extra("day_begin_date", today)
+            self.logger.info(
+                f"mci: day-begin baseline set = {remaining_gb:.2f} GB"
             )
+            self._run_bat("day-begin", self.day_begin_bat)
+
+        # --- today's usage = baseline − current remaining ---
+        baseline = self.client.get_extra("day_begin_quota_gb")
+        try:
+            baseline = float(baseline) if baseline is not None else None
+        except (TypeError, ValueError):
+            baseline = None
+        if baseline is None:
+            usage = 0.0
+            self.logger.warning(
+                "mci: no day-begin baseline yet; usage treated as 0"
+            )
+        else:
+            usage = max(0.0, baseline - remaining_gb)
+        self._last_usage_gb = usage
+        self.logger.info(
+            f"mci: today usage = {usage:.2f} GB / "
+            f"{self.daily_limit_gb:.2f} GB cap (remaining={remaining_gb:.2f})"
+        )
+
+        # --- cap reached: run the hook once, then pause polling ---
+        if usage >= self.reached_usage_gb and \
+                self.client.get_extra("reached_date") != today:
+            self.client.set_extra("reached_date", today)
+            self.logger.warning(
+                f"mci: daily usage cap reached "
+                f"({usage:.2f} >= {self.reached_usage_gb:.2f} GB); "
+                f"launching quota-reached bat, polling paused until "
+                f"next day"
+            )
+            self._run_bat("mci-quota-reached", self.quota_reached_bat)
+            if self.quota_warner is not None:
+                self.quota_warner.enqueue_cap(
+                    usage, remaining_gb, self.daily_limit_gb
+                )
             self._pending_notify = False
             return
-        # Below-threshold readings always pop the orange warning,
-        # regardless of pending_notify — the warning is more urgent
-        # than the "first-of-day-per-slot" gate. Normal readings only
-        # pop the info popup when this attempt was flagged
-        # notify-worthy.
-        if gb < self.threshold_gb:
-            self.quota_warner.enqueue_warning(gb)
-            self._mark_notify_date(slot)
-        elif self._pending_notify:
-            self.quota_warner.enqueue_info(gb)
-            self._mark_notify_date(slot)
+
+        # --- routine notifications (once/day, or on manual trigger) ---
+        if self.quota_warner is None:
+            if remaining_gb < self.warn_below_gb:
+                self.logger.warning(
+                    f"mci: {remaining_gb:.2f} GB remaining but no "
+                    f"quota_warner is wired up"
+                )
+            self._pending_notify = False
+            return
+        if self._pending_notify:
+            if remaining_gb < self.warn_below_gb:
+                self.quota_warner.enqueue_warning(remaining_gb)
+            else:
+                self.quota_warner.enqueue_info(remaining_gb)
+            self.client.set_extra("notify_date", today)
         self._pending_notify = False
 
     # ---- error notification ----
@@ -3304,13 +3356,11 @@ class MciWatcher:
     def _notify_error(self, message: str):
         """Enqueue an error popup if this attempt was flagged
         notify-worthy by tick(). Always logs at the call sites.
-        Clears ``_pending_notify`` and stamps the current slot's
-        ``notify_date_<slot>`` so same-day retries within that slot
-        don't spam."""
+        Clears ``_pending_notify`` and stamps ``notify_date`` so same-day
+        retries don't spam."""
         if not self._pending_notify:
             return
         self._pending_notify = False
-        slot = self._current_slot or self.SLOT_EVENING
         if self.quota_warner is None:
             self.logger.warning(
                 f"mci: would notify error but no quota_warner is wired up: "
@@ -3318,7 +3368,7 @@ class MciWatcher:
             )
             return
         self.quota_warner.enqueue_error(message)
-        self._mark_notify_date(slot)
+        self.client.set_extra("notify_date", self._today_str())
 
     # ---- file log ----
 
@@ -3579,6 +3629,18 @@ def show_quota_popup(parent: tk.Tk, kind: str, value, on_ack):
         accent = POPUP_ACCENT_INFO
         header_text = "MCI quota update"
         body_text = f"Remaining quota: {float(value):.2f} GB."
+    elif kind == "cap":
+        accent = POPUP_ACCENT_WARN
+        header_text = "MCI daily cap reached"
+        if isinstance(value, dict):
+            body_text = (
+                f"Daily usage {float(value.get('usage', 0)):.2f} GB of "
+                f"{float(value.get('limit', 0)):.2f} GB cap reached "
+                f"({float(value.get('remaining', 0)):.2f} GB remaining). "
+                f"Quota-reached action launched."
+            )
+        else:
+            body_text = str(value)
     elif kind == "error":
         accent = POPUP_ACCENT_ERROR
         header_text = "MCI quota fetch failed"

@@ -6,6 +6,10 @@ usage_total/
 usage_clients/
 temp/
 
+# local automation hooks (contain hardcoded deb6 SSH credentials)
+day-begin.bat
+mci-quota-reached.bat
+
 # user config + state (contains modem password, FTP creds, per-SMS state)
 smsFetcher.conf
 smsFetcher.state.json

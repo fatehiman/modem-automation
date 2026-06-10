@@ -9,12 +9,13 @@ short URL-only outbound SMS, so you receive it remotely. Also polls a
 [Telina hosted-PBX](https://hub.telina.ir/) account for new incoming calls
 and SMSes the caller numbers to a configured phone, so you get notified of
 calls that came in to your PBX while you were away. Reads the remaining
-internet quota off the [MCI customer panel](https://my.mci.ir/panel) **twice
-per local calendar day** — once on day-rollover (at 00:00, or on first
-detection if the PC was off) and once after the configured wall-clock
-time (default `19:30`); plus on demand from the tray menu. Auth is JWT
+internet quota off the [MCI customer panel](https://my.mci.ir/panel) on an
+**adaptive cadence to enforce a daily usage cap** — polls hourly, speeds up
+to every 10 minutes as usage nears the cap, runs a `day-begin` batch file at
+the start of each day and a `quota-reached` batch file once the day's usage
+hits the cap; plus on demand from the tray menu. Auth is JWT
 Bearer, refreshed by SMS-OTP. The flow is event-driven: if the session has
-expired, the daily tick POSTs send-otp and returns immediately; whenever
+expired, the tick POSTs send-otp and returns immediately; whenever
 the Fetcher saves the resulting OTP SMS, it dispatches the digits to the
 MCI watcher to complete verification + deferred quota fetch. When the
 quota drops below a configured threshold, a warning popup fires. Runs as
@@ -67,7 +68,7 @@ tray. Right-click it for three options (the middle one only when
 
 - **Log** — opens a modal with today's log file (Esc or Close to dismiss)
 - **Check MCI quota** — force-runs the MCI watcher's tick now, even
-  if today's auto-check has already succeeded. If the session is
+  if today's cap has already fired and polling is paused. If the session is
   still valid you'll see a fresh quota reading in the log within a
   second. If the session has expired, the tick POSTs send-otp and
   returns immediately — when the MCI OTP SMS lands in `sms_del/` a
@@ -210,9 +211,14 @@ gives full control over click behavior and styling.
   "mci_enabled": true,
   "mci_username": "9133169571",
   "mci_interval_seconds": 3600,
-  "mci_fetch_time": "19:30",
+  "mci_fast_poll_interval_seconds": 600,
   "mci_state_file": "mci_state.json",
   "mci_quota_below_gb": 5.0,
+  "mci_daily_limit_gb": 5.0,
+  "mci_quota_reached_usage_gb": 4.9,
+  "mci_fast_poll_usage_gb": 4.0,
+  "mci_day_begin_bat": "day-begin.bat",
+  "mci_quota_reached_bat": "mci-quota-reached.bat",
   "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
   "mci_otp_pattern": "Code:\\s*(\\d+)",
   "mci_otp_wait_seconds": 120,
@@ -533,20 +539,29 @@ content.
 ## Remaining-quota check via MCI panel
 
 A separate thread reads the remaining-internet-quota figure off the
-[MCI customer panel](https://my.mci.ir/panel) **once per local
-calendar day** — and on demand from the tray menu's `Check MCI
-quota`. When the reading drops below `mci_quota_below_gb`, a warning
-popup fires. Every reading is appended (or updated, keyed by
-timestamp) to `usage_total/<mci_quota_log_filename>` (default
-`remained_quota.txt`) so a history is built up regardless of
-threshold.
+[MCI customer panel](https://my.mci.ir/panel) on an **adaptive cadence
+that enforces a per-day usage cap** — and on demand from the tray
+menu's `Check MCI quota`. When the reading drops below
+`mci_quota_below_gb`, a warning popup fires. Every reading is appended
+(or updated, keyed by timestamp) to
+`usage_total/<mci_quota_log_filename>` (default `remained_quota.txt`)
+so a history is built up regardless of threshold.
+
+The MCI line has a fixed daily data allowance (`mci_daily_limit_gb`,
+default 5 GB). Because the panel only reports a large *remaining*
+figure (a rolling balance, not daily usage), the watcher derives
+**today's usage as a drop from a day-begin baseline**: the first
+reading of each local calendar day is stored as the baseline, and
+`usage = baseline − current_remaining` thereafter. This drives two
+batch-file hooks — see [Daily usage cap](#daily-usage-cap-and-adaptive-polling).
 
 Authentication is **JWT Bearer**, persisted across runs. The watcher
-stores `cookies + bearer + last_check_date` in `mci_state.json` and
-replays the JWT on every quota GET. The MCI server expires the
-session eventually (observed empirically as "many days to a few
-weeks") — when it does, the next quota GET returns 401/403 and the
-watcher transparently runs the OTP refresh.
+stores `cookies + bearer + day_begin_date + day_begin_quota_gb +
+reached_date + notify_date` in `mci_state.json` and replays the JWT on
+every quota GET. The MCI server expires the session eventually
+(observed empirically as "many days to a few weeks") — when it does,
+the next quota GET returns 401/403 and the watcher transparently runs
+the OTP refresh.
 
 ### Event-driven OTP flow
 
@@ -568,8 +583,8 @@ triggers a check while the session is dead), the flow is:
 4. `on_otp_received` POSTs `verify` with the code. On 2xx, the JWT
    is captured from the response body and saved. Then — because
    `_pending_quota_check` is set — the deferred `fetch_quota` runs,
-   logs the reading, marks today done, and (if below threshold)
-   enqueues a popup.
+   logs the reading, runs the day-begin/cap logic, and (if
+   notify-worthy or below threshold) enqueues a popup.
 
 A nice side-effect of this design: if **you** log in to the MCI
 website yourself in a browser, the OTP SMS that MCI sends *also*
@@ -582,62 +597,63 @@ entirely. If the OTP was already consumed by your browser before
 the Fetcher's poll cycle reached the SMS, our verify just fails
 quietly and the session state is left as-is.
 
-### Day tracking and scheduling — two slots per day
+### Daily usage cap and adaptive polling
 
-The day is split into two **scheduling slots**, each firing
-independently at most once per local calendar day:
+The watcher polls the panel repeatedly and tracks how much of the
+day's `mci_daily_limit_gb` allowance has been consumed, derived as a
+**drop from a day-begin baseline** (the panel reports only a rolling
+remaining balance, never daily usage). State persisted in
+`mci_state.json`:
 
-| Slot | Window | Intended trigger |
-| --- | --- | --- |
-| `early` | `[00:00, mci_fetch_time)` | Day-rollover refresh — catches when a new calendar day starts, even mid-morning. |
-| `evening` | `[mci_fetch_time, 24:00)` | End-of-day refresh — captures the late reading before the day ends. |
+- `day_begin_date` / `day_begin_quota_gb` — the date and the remaining
+  figure captured at the day's first reading (today's baseline).
+- `reached_date` — the date the cap last fired (also the
+  "polling-paused-for-the-day" marker).
+- `notify_date` — the date of the last popup (once-per-day cap).
 
-Each slot persists its own state in `mci_state.json`:
+**Lifecycle of a day:**
 
-- `check_date_early` / `check_date_evening` — the date of the last
-  successful quota fetch for that slot.
-- `notify_date_early` / `notify_date_evening` — the date of the last
-  popup shown for that slot (for the once-per-day-per-slot
-  notification cap).
+1. **Day begin** — the first tick of a new calendar day (`day_begin_date
+   != today`) fetches the remaining quota, stores it as the baseline,
+   and launches the `mci_day_begin_bat` hook. Usage for the rest of the
+   day is `baseline − current_remaining` (clamped at 0, so a mid-day
+   top-up that raises the remaining figure doesn't go negative).
+2. **Adaptive polling** — the watcher wakes every `mci_interval_seconds`
+   (default 3600 = hourly), accelerating to
+   `mci_fast_poll_interval_seconds` (default 600 = every 10 min) once
+   today's usage reaches `mci_fast_poll_usage_gb` (default 4.0 GB), so
+   the cap is caught promptly. It also always wakes one second past the
+   next local midnight to detect the new day. Same precision-tick
+   pattern as `UsageTracker._next_wake_seconds`.
+3. **Cap reached** — when usage reaches `mci_quota_reached_usage_gb`
+   (default 4.9 GB) the watcher launches the `mci_quota_reached_bat`
+   hook **exactly once** (`reached_date` guard) and then **pauses
+   polling until the next day-begin** (the next tick early-returns while
+   `reached_date == today`, and the wake interval collapses to
+   "sleep until midnight"). At midnight the new day re-runs day-begin,
+   which resumes normal polling.
 
-The watcher wakes on `min(mci_interval_seconds, time_until_next_midnight, time_until_next_fetch_time)`
-— the interval is an upper bound, and the two precise wakes (one
-second past midnight, one second past `mci_fetch_time`) give us
-slot-boundary-accurate ticks. Same pattern as
-`UsageTracker._next_wake_seconds` does for the midnight rollover.
+A tick *acts* only when **either** it's the first tick of a new day, or
+today's cap hasn't yet fired (auto path), **or** the user clicked
+*Check MCI quota* on the tray menu (`_force_run` via `trigger_now()`) —
+manual fires bypass the cap-pause and always notify.
 
-A tick *acts* only when **either**:
+The hooks are arbitrary batch files (resolved against the app dir if
+the path is relative); an empty or missing path is logged and skipped,
+never fatal. In this deployment they flip a downstream gateway between
+its 4G uplink (while MCI quota remains) and a fiber-backed VPN (once the
+cap is hit) — see the `day-begin.bat` / `mci-quota-reached.bat` files
+next to the exe.
 
-- The slot for the current wall-clock has `check_date_<slot> !=
-  today` (auto path). The slot is whichever window `now.time()`
-  falls in. A slot only fires within its own window — a missed early
-  slot (PC off all morning) is NOT caught up by the evening slot;
-  it's simply skipped for that day.
-- OR the user clicked *Check MCI quota* on the tray menu since the
-  last tick (`_force_run` set by `trigger_now()`) — manual fires
-  ignore both the slot-done and the slot-window gates.
+**App restart mid-day**: on first start after the app was down, if
+`day_begin_date` isn't today the tick is treated as a new day — it runs
+the day-begin hook and takes the baseline *then*. Usage therefore
+under-counts whatever was consumed earlier that day (logged as a
+warning). On upgrade from the previous two-slot scheduler, the old
+`check_date_*` / `notify_date_*` keys are dropped from the state file on
+first start.
 
-`check_date_<slot>` is written **on success** (after a successful
-quota read, regardless of whether OTP refresh was needed). A failure
-to fetch (network error, 5xx from MCI) leaves it unwritten, so the
-next tick within the same slot window retries — but a
-401-then-send-otp leaves it unwritten too, deliberately: today isn't
-"done" until we actually read the quota. The deferred quota fetch
-from `on_otp_received` is what writes today's date.
-
-**Catch-up within a slot window**: if the PC was off at midnight and
-boots at 09:00, the first tick after startup grace sees
-`now.time() < 19:30` → slot = early, `check_date_early` ≠ today
-→ fires. A whole missed day (PC off 24+ h) is not back-filled: the
-next day's ticks fire at midnight + 19:30 of *that* day, with no
-notification of the gap.
-
-**Disabling a slot**: setting `mci_fetch_time` to an empty string
-disables the early slot (the whole day becomes the evening window),
-reverting to single-daily-fetch behaviour. Migrations from the
-pre-slot version translate the old `last_check_date` /
-`last_notify_date` keys into both slots' values on first startup,
-so an upgrade doesn't fire spurious popups.
+This subsystem replaces an older USSD-based path (`*10*327#` → reply
 
 This subsystem replaces an older USSD-based path (`*10*327#` → reply
 `0` → cancel via the modem panel, plus an SMS-receipt parser for
@@ -656,10 +672,15 @@ app no longer triggers it automatically. Set `mci_enabled` to
 | --- | ------- | ------- |
 | `mci_enabled` | `true` | Master toggle. Off → no MciWatcher thread, no QuotaWarner thread, no `Check MCI quota` tray item. |
 | `mci_username` | `"9133169571"` | 10-digit Iran mobile number registered with MCI (no leading 0, no country code — the panel expects it bare). |
-| `mci_interval_seconds` | `3600` | Upper bound on watcher loop wake interval. The actual wake is `min(this, time_until_next_fetch_time)`, so the daily tick lands within seconds of `mci_fetch_time`. Used as a fallback wake when no scheduled time is set. |
-| `mci_fetch_time` | `"19:30"` | Wall-clock time (HH:MM, local) that splits the day into early `[00:00, mci_fetch_time)` and evening `[mci_fetch_time, 24:00)` slots — see [Day tracking and scheduling](#day-tracking-and-scheduling--two-slots-per-day). Empty string collapses the day into a single evening slot (one daily fetch). Catch-up: a slot fires on first tick within its window even if the slot's natural moment was missed during PC downtime. |
-| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `check_date_<slot>` + `notify_date_<slot>` (one of each per slot: early, evening) are persisted between runs. Delete the file to force a fresh OTP login + reset of both slots' "today done" + "already notified today" on next tick. |
-| `mci_quota_below_gb` | `5.0` | Threshold in GB. Pop the warning only when the scraped value is strictly less than this. |
+| `mci_interval_seconds` | `3600` | Normal poll interval (seconds). The watcher also always wakes one second past the next local midnight to detect the new day, so the effective wake is `min(this_or_fast, time_until_next_midnight)`. |
+| `mci_fast_poll_interval_seconds` | `600` | Faster poll interval (seconds) used once today's usage reaches `mci_fast_poll_usage_gb` — catches the cap promptly without polling hard all day. |
+| `mci_daily_limit_gb` | `5.0` | The line's daily data allowance. Informational (shown in logs/popups); the action trigger is `mci_quota_reached_usage_gb`. |
+| `mci_fast_poll_usage_gb` | `4.0` | Today's-usage threshold (GB) at which polling switches from `mci_interval_seconds` to `mci_fast_poll_interval_seconds`. |
+| `mci_quota_reached_usage_gb` | `4.9` | Today's-usage threshold (GB) at which the `mci_quota_reached_bat` hook fires (once per day) and polling pauses until the next day-begin. |
+| `mci_day_begin_bat` | `"day-begin.bat"` | Batch file launched at the first reading of each day (after the baseline is taken). Relative paths resolve against the app dir; empty/missing → logged and skipped. |
+| `mci_quota_reached_bat` | `"mci-quota-reached.bat"` | Batch file launched once when today's usage hits the cap. Relative paths resolve against the app dir; empty/missing → logged and skipped. |
+| `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `day_begin_date` + `day_begin_quota_gb` + `reached_date` + `notify_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of today's baseline/cap/notify state on next tick. |
+| `mci_quota_below_gb` | `5.0` | Threshold in GB for the **low-remaining** warning popup (separate from the daily-usage cap). Pop the warning only when the scraped *remaining* value is strictly less than this. |
 | `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. (a) the Fetcher routes matching SMSes straight to `sms_del/` so the OTP doesn't pop a toast; (b) right after saving, it extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. |
 | `mci_otp_pattern` | `"Code:\\s*(\\d+)"` | Regex extracting the OTP digits from the SMS body. First capture group is the code. |
 | `mci_otp_wait_seconds` | `120` | Cooldown after a `send-otp` — the watcher won't re-send for this long, even if a fresh tick triggers a new auth need. Prevents burning OTPs when an SMS gets stuck. Reset to zero on a successful verify. |
@@ -697,11 +718,10 @@ local timestamp prefix and a 2-decimal GB value:
 ```
 
 Lines are deduped by timestamp prefix and the file is kept sorted
-chronologically. With a 1-hour-granularity poll and once-per-day
-acting cadence, you typically get one line per day; the tray-menu
-*Check MCI quota* adds extra readings whenever you trigger it. If
-the threshold drops, all readings (above and below threshold) still
-land in the log; the threshold only gates the popup.
+chronologically. With hourly polling (10-minutely near the cap) you
+get several readings per active day; the tray-menu *Check MCI quota*
+adds extra readings whenever you trigger it. All readings (above and
+below threshold) land in the log; the threshold only gates the popup.
 
 ### Notifications
 
@@ -711,8 +731,9 @@ each other instead of overlapping):
 
 | Kind | Accent | Header | Body | Fires when |
 | --- | --- | --- | --- | --- |
-| info | green | `MCI quota update` | `Remaining quota: <N.NN> GB.` | Successful fetch, when the attempt was flagged notify-worthy (manual trigger OR first auto-tick of the day) AND value is at or above threshold. |
-| warning | orange | `Internet quota low` | `Internet quota is low: <N.NN> GB remaining.` | Successful fetch, value is **below** `mci_quota_below_gb`. Bypasses the once-per-day cap — every below-threshold reading fires, since the warning is more urgent than the daily gate. |
+| info | green | `MCI quota update` | `Remaining quota: <N.NN> GB.` | Successful fetch, when the attempt was flagged notify-worthy (manual trigger OR first notify-worthy auto-tick of the day) AND remaining is at or above `mci_quota_below_gb`. |
+| warning | orange | `Internet quota low` | `Internet quota is low: <N.NN> GB remaining.` | Successful fetch, remaining is **below** `mci_quota_below_gb`, on a notify-worthy attempt (once-per-day cap, like info). |
+| cap | orange | `MCI daily cap reached` | `Daily usage <U> GB of <L> GB cap reached (<R> GB remaining). Quota-reached action launched.` | Today's usage hit `mci_quota_reached_usage_gb`; fires once per day alongside the `mci_quota_reached_bat` hook. |
 | error | red | `MCI quota fetch failed` | error message (truncated to ~240 chars; full text in the log) | Auth or fetch failure on a notify-worthy attempt. Same once-per-day cap as info: an hours-long outage still pops only one error popup per day from the auto path. Manual clicks always notify. |
 
 All three pop **one button** (Dismiss) and are deferred under DND /
@@ -721,48 +742,41 @@ when Windows starts accepting notifications again, so a below-
 threshold scrape mid-game queues a warning that appears as soon as
 you exit fullscreen.
 
-### When notifications fire — the once-per-slot-per-day rule
+### When notifications fire — the once-per-day rule
 
-Each of the two scheduling slots gets its own notification quota.
-The watcher tracks `notify_date_early` and `notify_date_evening`
-separately in `mci_state.json`:
+Routine info/warning/error popups are capped to **one per day** via the
+single `notify_date` key in `mci_state.json` (the hourly poll would
+otherwise pop on every tick):
 
 - **Manual tick (tray menu *Check MCI quota*)**: always flagged
   notify-worthy. Every click gives the user immediate feedback.
-- **Auto tick (slot's window, slot not done)**: flagged
-  notify-worthy iff `today != notify_date_<slot>`. So the first auto
-  attempt of each slot per day pops on its outcome (success → green
-  info popup, failure → red error popup, below threshold → orange
-  warning). Subsequent same-day retries within the same slot —
-  which only happen if the first attempt errored and
-  `check_date_<slot>` hasn't advanced — go silent (logged only).
-- After enqueuing any popup, `notify_date_<slot>` is stamped to
-  today so further auto-attempts in that slot stay silent.
-- The below-threshold warning bypasses these gates entirely: every
-  below-threshold scrape pops, regardless of `notify_date_<slot>`.
-  Rationale: the threshold is rarely crossed (typically once per
-  billing cycle); spam isn't a realistic worry.
+- **Auto tick**: flagged notify-worthy iff `today != notify_date`. So
+  the first notify-worthy auto attempt of the day pops on its outcome
+  (success → green info, failure → red error, below threshold → orange
+  warning). After any popup is enqueued, `notify_date` is stamped to
+  today, so the rest of the day's polls stay silent (logged only).
+- The **cap** popup is independent of this gate: it fires once when
+  usage crosses `mci_quota_reached_usage_gb`, alongside the
+  `mci_quota_reached_bat` hook (guarded by `reached_date`).
 
-Worked examples (healthy = above threshold; below = orange warning):
+Worked examples:
 
-| Scenario | Day 1 popups |
+| Scenario | Day's popups |
 | --- | --- |
-| Healthy day, both slots succeed | 2 info popups — one at 00:00:01 (early), one at 19:30:01 (evening) |
-| Healthy day, quota below threshold | 2 warning popups (one per slot, threshold bypasses dedup) |
-| MCI down all day | 2 error popups (one per slot's first attempt); same-slot retries silent |
-| Early slot errors, evening succeeds | 1 error popup at 00:00, 1 info popup at 19:30 |
-| PC boots at 10:00, both healthy | 1 info popup at 10:00:20 (early slot catch-up), 1 info popup at 19:30:01 (evening) |
-| PC boots at 21:00, both healthy | 1 info popup at 21:00:20 (evening only — early slot's window was missed, no catch-up) |
+| Normal day, usage stays under the cap | 1 info popup (first notify-worthy poll of the day) |
+| Usage reaches the cap | 1 info popup early + 1 orange `cap` popup when usage ≥ 4.9 GB (and `mci-quota-reached.bat` runs) |
+| Remaining drops below `mci_quota_below_gb` | 1 orange low-quota warning (once/day) |
+| MCI down all day | 1 error popup (first attempt); same-day retries silent |
 | User clicks *Check MCI quota* 5 times | 5 info popups (manual always notifies) |
 
 ### Tray menu — `Check MCI quota`
 
-Force-runs the watcher's tick now, even if today is already done
-(`_force_run` flag clears `_last_check_date == today` short-circuit
-for one tick). If the session is still valid you get a fresh
-reading in the log within a second. If it isn't, the tick fires
+Force-runs the watcher's tick now, even if today's cap has already
+fired and polling is paused (`_force_run` bypasses the cap-pause for
+one tick and always notifies). If the session is still valid you get a
+fresh reading in the log within a second. If it isn't, the tick fires
 send-otp + returns; the SMS arrival path completes the read
-asynchronously, same as the daily auto path.
+asynchronously, same as the auto path.
 
 The menu item is only present when `mci_enabled` is true.
 
@@ -1302,29 +1316,31 @@ The log writer rolls over at midnight (next entry opens
   `sms_del/` retention sweep (every 6 h). State (per-SMS upload/sent
   timestamps, failure budget, pause-until) lives in
   `relay_state.json`.
-- **MciWatcher** — wakes on `min(mci_interval_seconds, time_until_next_midnight, time_until_mci_fetch_time)`
-  (default fetch time `19:30`); most ticks are no-ops. The day is
-  split into two slots (`early` `[00:00, mci_fetch_time)` and
-  `evening` `[mci_fetch_time, 24:00)`); each slot fires at most once
-  per local calendar day within its own window. When the slot for
-  the current wall-clock hasn't yet fired today (or the tray menu
-  forced a run), GETs `/api/unit/v1/packages/details`; on 401/403,
-  POSTs `send-otp` and returns immediately — no synchronous wait.
-  Receives the OTP digits asynchronously via
-  `on_otp_received(code)`, which the Fetcher calls when the SMS
-  arrives. After verify, runs the deferred fetch_quota, logs the
-  reading, marks today done, and (if below `mci_quota_below_gb`)
-  enqueues a popup via QuotaWarner. Also processes spontaneous
-  OTPs from the user's own browser logins (refreshes our session
-  opportunistically). Exposed via the tray menu's **Check MCI
-  quota** item, which sets `_force_run` so the next tick re-runs
-  even if today is already done. Skipped entirely when
-  `mci_enabled` is `false`. See [Remaining-quota check via MCI
+- **MciWatcher** — wakes on `min(poll_interval, time_until_next_midnight)`,
+  where `poll_interval` is `mci_interval_seconds` (hourly) or
+  `mci_fast_poll_interval_seconds` (10 min) once today's usage reaches
+  `mci_fast_poll_usage_gb`. The first reading of each day sets a usage
+  baseline and launches `mci_day_begin_bat`; usage =
+  `baseline − remaining`. When usage hits `mci_quota_reached_usage_gb`,
+  launches `mci_quota_reached_bat` once and pauses polling until the
+  next day-begin. Each acting tick GETs
+  `/api/unit/v1/packages/details`; on 401/403, POSTs `send-otp` and
+  returns immediately — no synchronous wait. Receives the OTP digits
+  asynchronously via `on_otp_received(code)`, which the Fetcher calls
+  when the SMS arrives. After verify, runs the deferred fetch_quota,
+  logs the reading, runs the day-begin/cap logic, and (when
+  notify-worthy) enqueues a popup via QuotaWarner. Also processes
+  spontaneous OTPs from the user's own browser logins (refreshes our
+  session opportunistically). Exposed via the tray menu's **Check MCI
+  quota** item, which sets `_force_run` so the next tick re-runs even
+  if polling is paused. Skipped entirely when `mci_enabled` is
+  `false`. See [Remaining-quota check via MCI
   panel](#remaining-quota-check-via-mci-panel).
 - **QuotaWarner** — ticks every 15 s, but most ticks are no-ops.
-  Drains a FIFO of MCI quota notifications (info / warning / error;
+  Drains a FIFO of MCI quota notifications (info / warning / cap / error;
   pushed by the MciWatcher via `enqueue_info(gb)` / `enqueue_warning(gb)`
-  / `enqueue_error(msg)`) into bottom-right Tk popups one at a time.
+  / `enqueue_cap(usage, remaining, limit)` / `enqueue_error(msg)`) into
+  bottom-right Tk popups one at a time.
   Gated by `accepts_notifications()` so it defers under DND. Started
   only when `mci_enabled` is `true` (since MciWatcher is the sole
   producer). See [Notifications](#notifications) for the popup variants
