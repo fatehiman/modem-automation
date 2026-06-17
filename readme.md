@@ -63,8 +63,8 @@ Everything is path-relative to the exe — fully portable, no install needed.
 ## Running
 
 Double-click `smsFetcher.exe`. A green-circle "S" icon appears in the system
-tray. Right-click it for three options (the middle one only when
-`mci_enabled` is `true`):
+tray. Right-click it for the menu (the **Check MCI quota** item only
+appears when `mci_enabled` is `true`):
 
 - **Log** — opens a modal with today's log file (Esc or Close to dismiss)
 - **Check MCI quota** — force-runs the MCI watcher's tick now, even
@@ -74,8 +74,18 @@ tray. Right-click it for three options (the middle one only when
   returns immediately — when the MCI OTP SMS lands in `sms_del/` a
   few seconds later, the Fetcher hands the digits to the watcher,
   which verifies and fetches the quota in the background. You won't
-  see a toast for the OTP SMS itself (it's routed silently). See
+  see a toast for the OTP SMS itself (it's routed silently). The tray
+  icon **blinks** for the whole duration of this operation, including
+  the OTP-wait window. See
   [Remaining-quota check via MCI panel](#remaining-quota-check-via-mci-panel).
+- **Disabled** — a checkable toggle (unchecked by default) that turns
+  the modem's 4G internet off/on by flipping the **Enabled** checkbox in
+  the panel's Settings → Mobile Network (Basic Settings). Checking it
+  disables 4G; unchecking re-enables it. The tray icon blinks during the
+  transition, then settles **gray** when disabled / back to its normal
+  colour when enabled. On failure the toggle reverts and a popup
+  reports it. **Double-clicking the tray icon** invokes this same
+  toggle. See [Disabling 4G internet from the tray](#disabling-4g-internet-from-the-tray).
 - **Exit** — stops the threads and quits
 
 A second launch shows a "smsFetcher is already running" warning and exits — the
@@ -122,6 +132,18 @@ single-instance guard binds `127.0.0.1:50917` (configurable).
   the relay finishes. Yellow is transient — it's a few seconds per
   forward — and always wins over red while it's on. See [SMS relay
   (when you're away)](#sms-relay-when-youre-away) below.
+- **Gray tray icon while 4G is disabled.** When the **Disabled** toggle
+  is checked, the icon goes gray and the tooltip reads
+  `smsFetcher (4G disabled)`. Gray overrides the colour states above.
+  See [Disabling 4G internet from the tray](#disabling-4g-internet-from-the-tray).
+- **Blinking tray icon while a background operation is in flight.** The
+  icon pulses (alternating a dim frame with the normal frame, ~0.5 s) for
+  the duration of two background activities: a **Check MCI quota** run
+  (including the entire OTP-wait window — from send-otp until the OTP SMS
+  lands and the quota is fetched) and a **Disabled** disable/enable
+  transition. The icon blinks while *any* such operation is active and
+  stops once they all finish. Other periodic work (inbox polling, the
+  Telina poll) does **not** blink the icon.
 - **DND respected.** When Windows is in Focus Assist, full-screen game,
   presentation mode, or "do not disturb", the queue **pauses** — no JSON
   gets consumed. As soon as DND clears, the next tick picks up the
@@ -350,6 +372,43 @@ While an FTP upload + outbound SMS is in flight, the tray icon goes
 yellow (and the tooltip reads `smsFetcher (relaying)` or
 `smsFetcher (relaying, N unread)`). It reverts to red or green when
 the relay finishes. Yellow always wins over red.
+
+## Disabling 4G internet from the tray
+
+The tray menu's **Disabled** item is a checkable toggle (unchecked by
+default) that turns the modem's 4G internet off and on by flipping the
+**Enabled** checkbox in the panel's Settings → Mobile Network (Basic
+Settings) — the `USB3G_ENABLE` field of `formLteSetup`. **Double-clicking
+the tray icon** does the same thing (the item is the menu's default
+action).
+
+Behaviour:
+
+- **Check Disabled** → the icon **blinks**, the app reads the live Mobile
+  Network form, flips only `USB3G_ENABLE` off (preserving every other
+  field), POSTs it, and re-reads to confirm. On success the icon stops
+  blinking and goes **gray** (`smsFetcher (4G disabled)`); a popup
+  confirms `Enabled checkbox is now OFF`.
+- **Uncheck Disabled** → the gray icon blinks, `USB3G_ENABLE` is flipped
+  back on, and on success the icon returns to its normal colour.
+- **On failure** (modem unreachable, login fails, or the modem doesn't
+  accept the change) the toggle **reverts** to the modem's real state,
+  blinking stops, the icon restores, and a red popup reports it (full
+  detail in the log). This matches the "always reflect reality" rule —
+  the checkbox never shows a state the modem isn't actually in.
+- While a transition is in flight the menu item is **greyed out** so
+  rapid clicks (or a double-click mid-transition) can't race; the worker
+  also guards re-entry internally.
+
+The full HTTP mechanics — why the whole form must be re-POSTed and how
+the current values are recovered from JS `var`s rather than HTML
+attributes — are documented under
+[Mobile-network enable/disable](#mobile-network-enabledisable--ltehtm--formltesetup).
+
+> **Note for the current deployment:** flipping this does not actually
+> drop internet, because the active gateway is elsewhere — the
+> `USB3G_ENABLE` field still flips (and the log records each change), but
+> connectivity is unaffected.
 
 ### State file: `relay_state.json`
 
@@ -1172,6 +1231,56 @@ Bulk delete uses the same `formSmsManage` with `submit-url=/sms_outbox.htm`,
 required quirk as inbox delete (must follow the 302 back to
 `/sms_outbox.htm` for the deletion to commit).
 
+### Mobile-network enable/disable — `/lte.htm` + `formLteSetup`
+
+Settings → Mobile Network (Basic Settings) is rendered at `GET /lte.htm`
+as a single form `formLteSetup`, submitted via `POST
+/boafrm/formLteSetup`. The "Enabled" checkbox is the field
+`USB3G_ENABLE`. `ModemClient.get_mobile_network_enabled()` /
+`set_mobile_network_enabled(bool)` read and flip it; the tray
+**Disabled** toggle drives them.
+
+**Critical quirk: current values are NOT in the HTML attributes.** Text
+inputs keep their value in the inline `value="…"`, but every
+checkbox / `<select>` / radio reflects its saved state through JS `var`
+assignments that `Load_Setting()` (the `<body onload>` handler) applies
+at load — e.g. `var enableLte='1';`, `var manual_apn='1';`,
+`var usb3g_nat='1';`, `var netselect='0';`, `var firstWanIndex='0';`.
+The static `<input>` tags carry no `checked` attribute. So you cannot
+read the current state from the markup alone — you must parse those vars.
+
+A real browser "Save & Apply" serialises the **live DOM**, which a
+correct POST must replicate exactly:
+
+- **Text fields** — always sent, with their inline `value` (`USB3G_USER`,
+  `USB3G_PASS`, `USB3G_APN`, `USB3G_PIN`, `USB3G_DIALNUM`, `USB3G_MTU`,
+  `USB3G_DNS1`, `USB3G_DNS2`, `USB3G_PINGPERIOD`, `USB3G_PINGADDR1..5`).
+- **Selects** — `USB3G_NETSELECT`, `USB3G_AUTHMETHOD`, `USB3G_IPVER`,
+  sent as the selected option value (read from `netselect` / `authmode`
+  / `ipver` vars).
+- **Checkboxes** — sent **only when checked**, as `name=on` (there is no
+  `value` attribute). State read from the matching var: `USB3G_ENABLE`←
+  `enableLte`, `USB3G_MANUALAPN`←`manual_apn`, `USB3G_LTEBRIDGE`←
+  `lteBridge`, `USB3G_LTEPPP`←`ltePpp`, `USB3G_NAT`←`usb3g_nat`,
+  `USB3G_Roam`←`usb3g_roam`, `MANUAL_DNS`←`manualDns`,
+  `USB3G_PINGCHECK`←`netcheckEnable`.
+- **Radio** `enabled` (Priority Nettype, WAN/LTE) — `ON` iff
+  `firstWanIndex=='6'`, else `OFF`.
+- Plus `submit-url=/lte.htm` and `save_apply=1` (the panel renames its
+  hidden `save_apply_flag` to `save_apply` on submit).
+
+To toggle without disturbing anything else: GET the page, parse the
+vars + inline values, flip **only** `USB3G_ENABLE`, rebuild the full
+body, POST, then re-GET to verify the new state. No caching — every
+call re-reads the live form first. Verified on the live modem with a
+disable→enable→restore round-trip that left APN/DNS/NAT/Roam/auth
+untouched.
+
+> On the current deployment, flipping this does **not** actually drop
+> internet (the active gateway is elsewhere); the field flip is the
+> contract. If you need it to genuinely cut connectivity, confirm which
+> control governs the active WAN on your setup first.
+
 ### Usage counters — known firmware quirks
 
 Two endpoints expose byte counters; both have caveats on this
@@ -1333,8 +1442,12 @@ The log writer rolls over at midnight (next entry opens
   spontaneous OTPs from the user's own browser logins (refreshes our
   session opportunistically). Exposed via the tray menu's **Check MCI
   quota** item, which sets `_force_run` so the next tick re-runs even
-  if polling is paused. Skipped entirely when `mci_enabled` is
-  `false`. See [Remaining-quota check via MCI
+  if polling is paused. Reports a busy state via `on_busy_change(bool)`
+  for the whole duration of a fetch/auth operation — including the
+  OTP-wait window (busy = a `tick`/`on_otp` body is running OR
+  `_pending_quota_check` is set) — which the main thread uses to blink
+  the tray icon. Skipped entirely when `mci_enabled` is `false`. See
+  [Remaining-quota check via MCI
   panel](#remaining-quota-check-via-mci-panel).
 - **QuotaWarner** — ticks every 15 s, but most ticks are no-ops.
   Drains a FIFO of MCI quota notifications (info / warning / cap / error;
@@ -1356,4 +1469,12 @@ The log writer rolls over at midnight (next entry opens
   `queue.Queue` for cross-thread UI requests (Log modal, SMS detail modal,
   Exit). Tray and toast callbacks fire on background threads and are
   bounced through the queue, since `tk.after()` is only loosely
-  thread-safe across Python versions.
+  thread-safe across Python versions. Also owns the tray-icon state
+  machine (`make_icon_image` colour/gray/blink frames) and the
+  **Disabled** 4G toggle worker (reads/flips `USB3G_ENABLE`, reverts on
+  failure). See [Disabling 4G internet from the
+  tray](#disabling-4g-internet-from-the-tray).
+- **Blink driver** — a small daemon thread that, while any tracked
+  background operation is active (a 4G disable/enable transition or an
+  MCI fetch/OTP-wait), alternates the tray icon's dim/normal frame every
+  ~0.5 s so it visibly blinks; idle otherwise.

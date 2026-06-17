@@ -581,6 +581,161 @@ class ModemClient:
             entry["rx"] += lte_down    # downloaded
         return result
 
+    # --- Mobile-network enable/disable ---
+    # Settings → Mobile Network (Basic Settings) is rendered at /lte.htm as
+    # the single form `formLteSetup` (POST /boafrm/formLteSetup). Crucially
+    # the page does NOT carry current values in HTML attributes — it bakes
+    # them into JS `var` assignments consumed by Load_Setting() on load
+    # (e.g. `var enableLte = '1';`, `var manual_apn = '1';`), while text
+    # fields keep their value in the inline `value="…"`. A real browser
+    # save serialises the live DOM: text inputs always, selects by selected
+    # option, checkboxes ONLY when checked (submitting name=on), the
+    # `enabled` radio (Priority Nettype), plus a `save_apply` flag.
+    #
+    # To toggle the "Enabled" checkbox (`USB3G_ENABLE`) without disturbing
+    # anything else we read the page, reconstruct that exact serialisation
+    # from the on-load state, flip only USB3G_ENABLE, and re-POST. No
+    # buffering/caching — every call re-reads the live form first.
+
+    _LTE_VAR_RE = re.compile(r"var\s+(\w+)\s*=\s*'([^']*)'\s*;")
+
+    # Map: POST field name -> JS var that holds its on-load checked state.
+    # A checkbox is submitted (as `on`) iff its var is truthy ('1' / non-empty
+    # for the enable flag). USB3G_ENABLE keys off `enableLte`.
+    _LTE_CHECKBOX_VARS = {
+        "USB3G_ENABLE": "enableLte",
+        "USB3G_MANUALAPN": "manual_apn",
+        "USB3G_LTEBRIDGE": "lteBridge",
+        "USB3G_LTEPPP": "ltePpp",
+        "USB3G_NAT": "usb3g_nat",
+        "USB3G_Roam": "usb3g_roam",
+        "MANUAL_DNS": "manualDns",
+        "USB3G_PINGCHECK": "netcheckEnable",
+    }
+    # Select field -> JS var holding its selected option value.
+    _LTE_SELECT_VARS = {
+        "USB3G_NETSELECT": "netselect",
+        "USB3G_AUTHMETHOD": "authmode",
+        "USB3G_IPVER": "ipver",
+    }
+    # Text fields are read from their inline value="" attribute.
+    _LTE_TEXT_FIELDS = (
+        "USB3G_USER", "USB3G_PASS", "USB3G_APN", "USB3G_PIN",
+        "USB3G_DIALNUM", "USB3G_MTU", "USB3G_DNS1", "USB3G_DNS2",
+        "USB3G_PINGPERIOD", "USB3G_PINGADDR1", "USB3G_PINGADDR2",
+        "USB3G_PINGADDR3", "USB3G_PINGADDR4", "USB3G_PINGADDR5",
+    )
+
+    def _get_lte_page(self) -> str:
+        url = f"{self.base}/lte.htm"
+        r = self.session.get(url, timeout=self.timeout)
+        if self._looks_unauthed(r.content):
+            self.logger.info("session expired, re-logging in (lte)")
+            self.login()
+            r = self.session.get(url, timeout=self.timeout)
+        r.raise_for_status()
+        if self._looks_unauthed(r.content):
+            raise RuntimeError("could not authenticate to fetch /lte.htm")
+        return r.content.decode("utf-8", errors="replace")
+
+    def _parse_lte_form(self, t: str) -> dict:
+        """Reconstruct the browser's formLteSetup serialisation from the
+        on-load state baked into the page. Returns
+        {"enabled": bool, "fields": {name: value}, "checkboxes":
+        {name: bool}} so callers can flip one checkbox and rebuild the
+        POST body deterministically."""
+        vars_map: dict[str, str] = {}
+        for m in self._LTE_VAR_RE.finditer(t):
+            # Load_Setting()'s block runs last; last write wins, which is
+            # exactly the live state we want.
+            vars_map[m.group(1)] = m.group(2)
+
+        def text_val(name: str) -> str:
+            m = re.search(
+                r'<input[^>]*name\s*=\s*"?' + re.escape(name) + r'"?[^>]*>',
+                t, re.I,
+            )
+            if not m:
+                return ""
+            v = re.search(r'value\s*=\s*"([^"]*)"', m.group(0))
+            return v.group(1) if v else ""
+
+        fields = {name: text_val(name) for name in self._LTE_TEXT_FIELDS}
+        for field, var in self._LTE_SELECT_VARS.items():
+            fields[field] = vars_map.get(var, "0")
+        # Priority Nettype radio: Load_Setting picks index 1 (ON) only when
+        # firstWanIndex == '6', else index 0 (OFF).
+        fields["enabled"] = (
+            "ON" if vars_map.get("firstWanIndex", "0") == "6" else "OFF"
+        )
+
+        checkboxes: dict[str, bool] = {}
+        for field, var in self._LTE_CHECKBOX_VARS.items():
+            raw = vars_map.get(var, "0")
+            checkboxes[field] = raw not in ("0", "")
+
+        return {
+            "enabled": checkboxes["USB3G_ENABLE"],
+            "fields": fields,
+            "checkboxes": checkboxes,
+        }
+
+    def get_mobile_network_enabled(self) -> bool:
+        """Current state of Settings → Mobile Network → Enabled
+        (USB3G_ENABLE)."""
+        return self._parse_lte_form(self._get_lte_page())["enabled"]
+
+    def set_mobile_network_enabled(self, enabled: bool) -> bool:
+        """Flip only the "Enabled" checkbox of the Mobile Network form,
+        preserving every other field, and POST the full form exactly as
+        the panel's Save & Apply would. Re-reads the page afterwards to
+        confirm the new state. Returns the verified state (True/False).
+        Raises on transport/auth failure or if the modem didn't accept
+        the change."""
+        parsed = self._parse_lte_form(self._get_lte_page())
+        data: list[tuple[str, str]] = []
+        for name in self._LTE_TEXT_FIELDS:
+            data.append((name, parsed["fields"].get(name, "")))
+        for name in self._LTE_SELECT_VARS:
+            data.append((name, parsed["fields"].get(name, "0")))
+        # Checkboxes: a browser only sends checked boxes (as `on`). Flip
+        # USB3G_ENABLE to the requested state; leave the rest untouched.
+        checkboxes = dict(parsed["checkboxes"])
+        checkboxes["USB3G_ENABLE"] = bool(enabled)
+        for name, on in checkboxes.items():
+            if on:
+                data.append((name, "on"))
+        data.append(("enabled", parsed["fields"].get("enabled", "OFF")))
+        data.append(("submit-url", "/lte.htm"))
+        # The panel renames the hidden save_apply_flag to `save_apply` on
+        # submit; replicate the resulting field (value "1").
+        data.append(("save_apply", "1"))
+
+        r = self.session.post(
+            f"{self.base}/boafrm/formLteSetup",
+            data=data,
+            headers={"Referer": f"{self.base}/lte.htm"},
+            timeout=self.timeout,
+            allow_redirects=True,
+        )
+        if r.status_code != 200 or self._looks_unauthed(r.content):
+            raise RuntimeError(
+                f"set_mobile_network_enabled: HTTP {r.status_code} "
+                f"or session lost"
+            )
+        # Verify by re-reading. The modem applies the LTE profile change
+        # synchronously enough that the next page render reflects it.
+        actual = self.get_mobile_network_enabled()
+        if actual != bool(enabled):
+            raise RuntimeError(
+                f"set_mobile_network_enabled: requested {enabled} but "
+                f"modem still reports {actual}"
+            )
+        self.logger.info(
+            f"mobile network Enabled set to {actual} (USB3G_ENABLE)"
+        )
+        return actual
+
 
 # ---------- persistence ----------
 
@@ -2980,10 +3135,20 @@ class MciWatcher:
     STARTUP_GRACE_SECONDS = 20
 
     def __init__(self, cfg: dict, logger: logging.Logger,
-                 quota_warner: "QuotaWarner | None"):
+                 quota_warner: "QuotaWarner | None",
+                 on_busy_change=None):
         self.cfg = cfg
         self.logger = logger
         self.quota_warner = quota_warner
+        # Called with True when an MCI operation begins (a tick's
+        # fetch/auth attempt, or the OTP-wait window) and False once it
+        # fully completes. Drives the tray-icon blink. The OTP-wait
+        # window counts as busy: from send-otp until on_otp_received
+        # resolves it. Recomputed at the boundaries of tick() /
+        # on_otp_received() via _refresh_busy().
+        self.on_busy_change = on_busy_change
+        self._busy = False
+        self._busy_active = False   # True while inside tick/on_otp body
         self.app = app_dir()
         self.quota_log_path = (
             self.app / cfg["usage_total_folder"]
@@ -3048,6 +3213,22 @@ class MciWatcher:
     def stop(self):
         self._stop.set()
         self._wake.set()
+
+    def _refresh_busy(self):
+        """Recompute the busy state and fire on_busy_change on edges.
+        Busy = a tick/on_otp body is executing, OR we're parked waiting
+        for an OTP SMS to come back (_pending_quota_check). Called at the
+        boundaries of tick() and on_otp_received() while holding
+        _client_lock."""
+        busy = self._busy_active or self._pending_quota_check
+        if busy == self._busy:
+            return
+        self._busy = busy
+        if self.on_busy_change:
+            try:
+                self.on_busy_change(busy)
+            except Exception as e:
+                self.logger.error(f"mci: on_busy_change failed: {e}")
 
     def trigger_now(self):
         """Tray-menu manual fire — re-run the tick now even if today's
@@ -3144,35 +3325,46 @@ class MciWatcher:
 
     def tick(self):
         with self._client_lock:
-            force = self._force_run
-            self._force_run = False
-            today = self._today_str()
-            # First tick of a new calendar day (or first run ever): the
-            # upcoming fetch establishes today's baseline and runs the
-            # day-begin hook. A new day also implicitly clears yesterday's
-            # cap/notify gating (they key off the date).
-            new_day = self.client.get_extra("day_begin_date") != today
-            if new_day:
-                self._pending_day_begin = True
-            if force:
-                # Manual trigger: bypass the cap-pause and always notify.
+            self._busy_active = True
+            self._refresh_busy()
+            try:
+                self._tick_locked()
+            finally:
+                self._busy_active = False
+                self._refresh_busy()
+
+    def _tick_locked(self):
+        """Body of tick(); caller holds _client_lock and manages the
+        busy flag."""
+        force = self._force_run
+        self._force_run = False
+        today = self._today_str()
+        # First tick of a new calendar day (or first run ever): the
+        # upcoming fetch establishes today's baseline and runs the
+        # day-begin hook. A new day also implicitly clears yesterday's
+        # cap/notify gating (they key off the date).
+        new_day = self.client.get_extra("day_begin_date") != today
+        if new_day:
+            self._pending_day_begin = True
+        if force:
+            # Manual trigger: bypass the cap-pause and always notify.
+            self._pending_notify = True
+            self.logger.info("mci: force-triggered tick")
+        else:
+            # Auto path: if today's cap already fired, polling is
+            # paused until the next day-begin — skip (a new day is
+            # never "already reached", so day-begin still runs).
+            if not new_day and \
+                    self.client.get_extra("reached_date") == today:
+                return
+            # Once-per-day notification cap: an outage that keeps the
+            # hourly poll failing won't pop more than one popup/day.
+            if self.client.get_extra("notify_date") != today:
                 self._pending_notify = True
-                self.logger.info("mci: force-triggered tick")
-            else:
-                # Auto path: if today's cap already fired, polling is
-                # paused until the next day-begin — skip (a new day is
-                # never "already reached", so day-begin still runs).
-                if not new_day and \
-                        self.client.get_extra("reached_date") == today:
-                    return
-                # Once-per-day notification cap: an outage that keeps the
-                # hourly poll failing won't pop more than one popup/day.
-                if self.client.get_extra("notify_date") != today:
-                    self._pending_notify = True
-                self.logger.info(
-                    f"mci: tick (today={today}, new_day={new_day})"
-                )
-            self._try_fetch_or_request_otp()
+            self.logger.info(
+                f"mci: tick (today={today}, new_day={new_day})"
+            )
+        self._try_fetch_or_request_otp()
 
     def _try_fetch_or_request_otp(self):
         """Caller must hold ``_client_lock``."""
@@ -3229,6 +3421,18 @@ class MciWatcher:
         if not code:
             return
         with self._client_lock:
+            self._busy_active = True
+            self._refresh_busy()
+            try:
+                self._on_otp_received_locked(code)
+            finally:
+                self._busy_active = False
+                self._refresh_busy()
+
+    def _on_otp_received_locked(self, code: str):
+        """Body of on_otp_received(); caller holds _client_lock and
+        manages the busy flag."""
+        if True:
             self.logger.info(
                 f"mci: OTP received (len={len(code)}); verifying"
             )
@@ -3402,21 +3606,44 @@ class MciWatcher:
 
 # ---------- tray icon image ----------
 
-def make_icon_image(unread: int = 0, relaying: bool = False) -> Image.Image:
-    """Black 'S' on a filled circle, transparent background. Three
+def make_icon_image(unread: int = 0, relaying: bool = False,
+                    disabled: bool = False,
+                    blink_off: bool = False) -> Image.Image:
+    """Black 'S' on a filled circle, transparent background. Base
     states: yellow while a relay (FTP upload + outbound SMS) is in
     flight, red while toasts are awaiting acknowledgement, green when
     idle. Yellow wins over red because it is transient and meaningful
-    (the user is actively being forwarded an SMS via the modem)."""
+    (the user is actively being forwarded an SMS via the modem).
+
+    The mobile-network "Disabled" tray toggle layers two extra states
+    on top:
+    - ``disabled=True`` greys the circle (gray fill) to convey that 4G
+      internet is turned off, overriding the colour states above.
+    - ``blink_off=True`` renders the dim frame of a blink cycle (used
+      while a disable/enable transition is in flight): the circle and
+      glyph are drawn faint so alternating with the normal frame on a
+      timer reads as a blink. Honoured in both the enabled and disabled
+      colourings."""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    if relaying:
+    if disabled:
+        circle_fill = (150, 150, 150, 255)
+    elif relaying:
         circle_fill = (240, 200, 0, 255)
     elif unread > 0:
         circle_fill = (210, 30, 30, 255)
     else:
         circle_fill = (0, 170, 60, 255)
+    glyph_color = (0, 0, 0, 255)
+    if blink_off:
+        # Dim frame: fade the circle toward the transparent background
+        # and lighten the glyph so the icon visibly pulses.
+        r, g, b, _ = circle_fill
+        circle_fill = (
+            (r + 255) // 2, (g + 255) // 2, (b + 255) // 2, 90,
+        )
+        glyph_color = (90, 90, 90, 120)
     d.ellipse((1, 1, size - 1, size - 1), fill=circle_fill)
     font = None
     for name in ("arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf"):
@@ -3439,7 +3666,7 @@ def make_icon_image(unread: int = 0, relaying: bool = False) -> Image.Image:
         ox = oy = 0
     d.text(
         ((size - tw) / 2 + ox, (size - th) / 2 + oy - 2),
-        text, fill=(0, 0, 0, 255), font=font,
+        text, fill=glyph_color, font=font,
     )
     return img
 
@@ -3650,6 +3877,16 @@ def show_quota_popup(parent: tk.Tk, kind: str, value, on_ack):
         if len(msg) > 240:
             msg = msg[:240].rstrip() + "…"
         body_text = msg
+    elif kind == "net":
+        # Mobile-network disable/enable result. `value` is a dict
+        # {"header": ..., "body": ...}. Red header when the toggle
+        # failed (header contains "failed"), else informational.
+        header_text = str((value or {}).get("header", "4G internet"))
+        body_text = str((value or {}).get("body", ""))
+        accent = (
+            POPUP_ACCENT_ERROR if "fail" in header_text.lower()
+            else POPUP_ACCENT_INFO
+        )
     else:
         accent = POPUP_ACCENT_INFO
         header_text = "MCI quota"
@@ -3866,33 +4103,67 @@ def main() -> int:
     usage_thread.start()
 
     icon_holder = {"icon": None}
-    icon_state = {"unread": 0, "relaying": False}
+    # disabled: 4G internet currently turned off (gray icon).
+    # transitioning: a disable/enable POST is in flight (icon blinks).
+    # mci_busy: an MCI quota fetch / OTP-wait operation is in flight
+    #   (icon blinks). blink_off: current blink frame (toggled by the
+    #   blink thread). The icon blinks whenever ANY busy flag is set.
+    icon_state = {
+        "unread": 0, "relaying": False,
+        "disabled": False, "transitioning": False,
+        "mci_busy": False, "blink_off": False,
+    }
     icon_state_lock = threading.Lock()
 
+    def _blink_active_locked() -> bool:
+        # Caller holds icon_state_lock. Blink if any tracked background
+        # operation is running (4G toggle transition or MCI fetch/OTP).
+        return icon_state["transitioning"] or icon_state["mci_busy"]
+
     def _refresh_icon():
-        # Yellow (relaying) wins over red (unread) wins over green
-        # (idle). pystray supports updating icon.icon and icon.title
-        # from any thread, but bouncing through one helper keeps the
-        # state machine in one place.
+        # Gray (disabled) overrides the colour states; otherwise yellow
+        # (relaying) wins over red (unread) wins over green (idle).
+        # blink_off renders the dim frame while any background op is in
+        # flight (4G toggle transition or MCI fetch/OTP). pystray
+        # supports updating icon.icon and icon.title from any thread, but
+        # bouncing through one helper keeps the state machine in one place.
         icon = icon_holder.get("icon")
         if icon is None:
             return
         with icon_state_lock:
             unread = icon_state["unread"]
             relaying = icon_state["relaying"]
+            disabled = icon_state["disabled"]
+            transitioning = icon_state["transitioning"]
+            mci_busy = icon_state["mci_busy"]
+            blink_off = icon_state["blink_off"] and _blink_active_locked()
         try:
-            icon.icon = make_icon_image(unread=unread, relaying=relaying)
+            icon.icon = make_icon_image(
+                unread=unread, relaying=relaying,
+                disabled=disabled, blink_off=blink_off,
+            )
+            suffix = []
+            if disabled:
+                suffix.append("4G disabled")
+            if transitioning:
+                suffix.append("switching…")
+            if mci_busy:
+                suffix.append("checking quota…")
             if relaying:
-                icon.title = (
-                    f"{APP_NAME} (relaying, {unread} unread)" if unread
-                    else f"{APP_NAME} (relaying)"
-                )
-            elif unread:
-                icon.title = f"{APP_NAME} ({unread} unread)"
-            else:
-                icon.title = APP_NAME
+                suffix.append("relaying")
+            if unread:
+                suffix.append(f"{unread} unread")
+            icon.title = (
+                f"{APP_NAME} ({', '.join(suffix)})" if suffix else APP_NAME
+            )
         except Exception as e:
             logger.error(f"icon update failed: {e}", exc_info=True)
+
+    def on_mci_busy_change(on: bool):
+        with icon_state_lock:
+            icon_state["mci_busy"] = on
+        _refresh_icon()
+        logger.info(f"icon: mci_busy={on}")
 
     def on_unread_change(count: int):
         with icon_state_lock:
@@ -3905,6 +4176,119 @@ def main() -> int:
             icon_state["relaying"] = on
         _refresh_icon()
         logger.info(f"icon: relaying={on}")
+
+    # --- mobile-network "Disabled" tray toggle ---
+    #
+    # State the menu's checkbox reflects (checked == 4G internet disabled).
+    # Default unchecked. A single worker at a time owns the modem POST; the
+    # busy flag both serialises clicks and tells the menu to grey-out the
+    # item while a transition is in flight.
+    net_toggle = {"checked": False, "busy": False}
+    net_toggle_lock = threading.Lock()
+
+    # Blink driver: while any tracked background operation is in flight
+    # (a disable/enable POST, or an MCI quota fetch / OTP-wait), alternate
+    # the dim/normal frame on a timer so the tray icon visibly blinks.
+    # Idle otherwise. This blinks the icon in the system tray for ANY
+    # observer, not just this app's own windows.
+    blink_stop = threading.Event()
+
+    def _blink_loop():
+        while not blink_stop.is_set():
+            with icon_state_lock:
+                active = _blink_active_locked()
+                if active:
+                    icon_state["blink_off"] = not icon_state["blink_off"]
+                else:
+                    icon_state["blink_off"] = False
+            if active:
+                _refresh_icon()
+            blink_stop.wait(0.5)
+
+    blink_thread = threading.Thread(target=_blink_loop, daemon=True)
+    blink_thread.start()
+
+    def _notify_net(kind: str, message: str):
+        """Surface a disable/enable result to the user via the shared
+        toast path (reuses show_quota_popup's plain rendering)."""
+        ui_queue.put((
+            "show_quota_popup",
+            {"kind": "net", "value": {"header": kind, "body": message},
+             "on_ack": None},
+        ))
+
+    def _apply_net_disabled(want_disabled: bool):
+        """Worker: start the icon blinking, POST the new Mobile-Network
+        Enabled state to the modem (Enabled = not disabled), then settle
+        the icon to gray (disabled) or normal (enabled). On any failure,
+        revert the menu toggle, stop blinking, restore the prior icon and
+        notify the user (see AskUserQuestion: "Revert toggle + notify")."""
+        with icon_state_lock:
+            icon_state["transitioning"] = True
+        _refresh_icon()
+        ok = False
+        try:
+            fetcher.modem.set_mobile_network_enabled(not want_disabled)
+            ok = True
+        except Exception as e:
+            logger.error(
+                f"net-toggle: failed to set Enabled={not want_disabled}: "
+                f"{e}", exc_info=True,
+            )
+        with net_toggle_lock:
+            if ok:
+                net_toggle["checked"] = want_disabled
+            else:
+                # Revert to the state the modem is actually in.
+                net_toggle["checked"] = not want_disabled
+            net_toggle["busy"] = False
+            settled_disabled = net_toggle["checked"]
+        with icon_state_lock:
+            icon_state["transitioning"] = False
+            icon_state["blink_off"] = False
+            icon_state["disabled"] = settled_disabled
+        _refresh_icon()
+        # Menu checkmark/enabled-state is recomputed by pystray from the
+        # callables on next open; force an immediate redraw too.
+        try:
+            icon = icon_holder.get("icon")
+            if icon is not None:
+                icon.update_menu()
+        except Exception:
+            pass
+        if ok:
+            state = "disabled" if want_disabled else "enabled"
+            logger.info(f"net-toggle: 4G internet {state}")
+            _notify_net(
+                "4G internet " + state,
+                f"Mobile Network Enabled checkbox is now "
+                f"{'OFF' if want_disabled else 'ON'}.",
+            )
+        else:
+            _notify_net(
+                "4G toggle failed",
+                "Could not change the modem's Mobile Network Enabled "
+                "setting; the toggle was reverted. See the log for "
+                "details.",
+            )
+
+    def on_net_toggle(_icon, _item):
+        with net_toggle_lock:
+            if net_toggle["busy"]:
+                logger.info("net-toggle: ignored — transition in flight")
+                return
+            want = not net_toggle["checked"]
+            net_toggle["busy"] = True
+        logger.info(
+            f"tray: Disabled toggled -> want_disabled={want}"
+        )
+        threading.Thread(
+            target=_apply_net_disabled, args=(want,), daemon=True,
+        ).start()
+
+    def _net_toggle_checked(_item):
+        with net_toggle_lock:
+            return net_toggle["checked"]
 
     notifier = Notifier(
         cfg, logger, ui_queue,
@@ -3942,7 +4326,10 @@ def main() -> int:
     # so a broken MCI poll never affects the main flow.
     mci: "MciWatcher | None" = None
     if cfg.get("mci_enabled", True):
-        mci = MciWatcher(cfg, logger, quota_warner=quota_warner)
+        mci = MciWatcher(
+            cfg, logger, quota_warner=quota_warner,
+            on_busy_change=on_mci_busy_change,
+        )
         # Wire the OTP callback path: Fetcher saves an MCI OTP SMS →
         # extracts the digits → calls mci.on_otp_received(code).
         fetcher.mci_watcher = mci
@@ -4038,6 +4425,7 @@ def main() -> int:
                     notifier.stop()
                     usage.stop()
                     relayer.stop()
+                    blink_stop.set()
                     if mci is not None:
                         mci.stop()
                     if quota_warner is not None:
@@ -4053,9 +4441,26 @@ def main() -> int:
 
     root.after(100, pump_ui)
 
+    def _net_toggle_enabled(_item):
+        # Grey the item out (non-clickable) while a transition is mid-flight.
+        with net_toggle_lock:
+            return not net_toggle["busy"]
+
     menu_items = [pystray.MenuItem("Log", on_log)]
     if mci is not None:
         menu_items.append(pystray.MenuItem("Check MCI quota", on_check_mci))
+    # Checkable "Disabled" — unchecked by default. Checking it disables the
+    # modem's 4G internet (unchecks Mobile Network → Enabled); unchecking
+    # re-enables it. The tray icon blinks during the transition, then goes
+    # gray when disabled / back to normal colour when enabled.
+    # default=True makes a double-click on the tray icon invoke this same
+    # toggle (pystray routes icon activation to the default item).
+    menu_items.append(pystray.MenuItem(
+        "Disabled", on_net_toggle,
+        checked=_net_toggle_checked,
+        enabled=_net_toggle_enabled,
+        default=True,
+    ))
     menu_items.append(pystray.MenuItem("Exit", on_exit))
 
     icon = pystray.Icon(
@@ -4074,6 +4479,7 @@ def main() -> int:
         notifier.stop()
         usage.stop()
         relayer.stop()
+        blink_stop.set()
         if mci is not None:
             mci.stop()
         if quota_warner is not None:
