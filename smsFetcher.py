@@ -118,7 +118,22 @@ DEFAULT_CONFIG = {
     "mci_quota_reached_bat": "mci-quota-reached.bat",
     "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
     "mci_otp_pattern": r"Code:\s*(\d+)",
-    "mci_otp_wait_seconds": 120,
+    # How long one OTP attempt stays "active" (icon blinks) waiting for
+    # the SMS to land. Kept short so a never-arriving OTP doesn't blink
+    # forever — on expiry the watcher backs off and retries. Also the
+    # send-otp re-send cooldown.
+    "mci_otp_wait_seconds": 60,
+    # Retry-with-backoff ladder (seconds) used after an OTP attempt
+    # times out without the code arriving. The watcher waits the next
+    # rung, re-requests an OTP, and waits ``mci_otp_wait_seconds`` again.
+    # The last rung repeats forever (every 6 h) until a human intervenes
+    # or auth succeeds. The icon does NOT blink during these waits — only
+    # during the active OTP-wait window of each attempt.
+    "mci_otp_backoff_seconds": [300, 1800, 3600, 21600],
+    # Upper bound on any single _wake.wait() slice so the loop stays
+    # responsive (detects OTP-wait expiry / stop within this window even
+    # when a long backoff or sleep-until-midnight is scheduled).
+    "mci_max_wait_slice_seconds": 60,
     "mci_quota_log_filename": "remained_quota.txt",
 }
 
@@ -1064,11 +1079,12 @@ class Fetcher:
             sender = rec["sender"]
             blocked = bool(self.blacklist and self.blacklist.contains(sender))
             is_otp = self._is_mci_otp(rec)
-            # OTP SMSes go straight to sms_del/ — they should never
-            # bother the user with a popup. The MciWatcher receives
-            # the code via the _maybe_dispatch_otp callback below, not
-            # by scanning the folders.
-            target_dir = self.del_dir if (blocked or is_otp) else self.sms_dir
+            # OTP SMSes are saved to sms/ and notified like any other
+            # received SMS (even when auto-triggered) so the user always
+            # sees the code arrive. The MciWatcher additionally receives
+            # the digits via the _maybe_dispatch_otp callback below.
+            # Blocked senders still go straight to sms_del/.
+            target_dir = self.del_dir if blocked else self.sms_dir
             try:
                 path = save_sms(rec, target_dir, self.cfg["modem_url"])
             except Exception as e:
@@ -1077,10 +1093,15 @@ class Fetcher:
                 )
                 continue
             if is_otp:
+                # Saved to sms/ (unless the sender is blacklisted) so the
+                # Notifier shows it like any received SMS. Always dispatch
+                # the digits to the MciWatcher. Not forwarded onward.
                 self.logger.info(
                     f"OTP-MCI index={idx} sender={sender} "
                     f"received_at='{rec['received_at']}' -> "
-                    f"{target_dir.name}/{path.name} (routed silently)"
+                    f"{target_dir.name}/{path.name} "
+                    f"({'blocked, silent' if blocked else 'notified'}; "
+                    f"code dispatched)"
                 )
                 self._maybe_dispatch_otp(rec)
             elif blocked:
@@ -3111,8 +3132,13 @@ class MciWatcher:
       - ``trigger_now()`` (tray *Check MCI quota*) forces an immediate
         re-run, bypassing the cap-pause and the once-per-day notify gate.
 
-    Cooldown: after a successful send-otp the watcher won't re-send for
-    ``mci_otp_wait_seconds`` (default 120 s); reset on successful verify.
+    OTP attempt lifecycle: each send-otp opens an active wait window of
+    ``mci_otp_wait_seconds`` (default 60 s) during which the icon blinks.
+    If the code arrives, verify → deferred fetch, and the attempt counter
+    resets. If the window lapses, the blink stops and the watcher backs
+    off per ``mci_otp_backoff_seconds`` (5 min → 30 min → 60 min → 6 h,
+    last rung repeating forever) before requesting another OTP. Any
+    successful auth/fetch resets the ladder.
 
     State persisted to ``mci_state.json`` extras:
       - ``day_begin_date`` (YYYY-MM-DD) / ``day_begin_quota_gb`` (float)
@@ -3141,11 +3167,13 @@ class MciWatcher:
         self.logger = logger
         self.quota_warner = quota_warner
         # Called with True when an MCI operation begins (a tick's
-        # fetch/auth attempt, or the OTP-wait window) and False once it
-        # fully completes. Drives the tray-icon blink. The OTP-wait
-        # window counts as busy: from send-otp until on_otp_received
-        # resolves it. Recomputed at the boundaries of tick() /
-        # on_otp_received() via _refresh_busy().
+        # fetch/auth attempt, or the *active* OTP-wait window) and False
+        # once it ends. Drives the tray-icon blink. The OTP-wait window
+        # is bounded by ``otp_wait_s`` (see _otp_wait_active): once it
+        # lapses the blink stops even if the code never arrived — the
+        # watcher then backs off and retries. Recomputed at the
+        # boundaries of tick()/on_otp_received() and each run-loop wait
+        # slice via _refresh_busy().
         self.on_busy_change = on_busy_change
         self._busy = False
         self._busy_active = False   # True while inside tick/on_otp body
@@ -3168,7 +3196,20 @@ class MciWatcher:
         self.fast_interval_s = float(
             cfg.get("mci_fast_poll_interval_seconds", 600)
         )
-        self.otp_wait_s = int(cfg.get("mci_otp_wait_seconds", 120))
+        self.otp_wait_s = int(cfg.get("mci_otp_wait_seconds", 60))
+        # Backoff ladder (seconds) between OTP attempts that timed out.
+        # Last rung repeats forever. Sanitised to a non-empty list of
+        # positive numbers.
+        ladder = cfg.get("mci_otp_backoff_seconds") or [300, 1800, 3600, 21600]
+        try:
+            self.otp_backoff_s = [float(x) for x in ladder if float(x) > 0]
+        except (TypeError, ValueError):
+            self.otp_backoff_s = [300.0, 1800.0, 3600.0, 21600.0]
+        if not self.otp_backoff_s:
+            self.otp_backoff_s = [300.0, 1800.0, 3600.0, 21600.0]
+        self.max_wait_slice_s = max(
+            1.0, float(cfg.get("mci_max_wait_slice_seconds", 60))
+        )
         # Batch-file hooks (resolved against the app dir if relative).
         self.day_begin_bat = str(cfg.get("mci_day_begin_bat", "") or "")
         self.quota_reached_bat = str(
@@ -3192,6 +3233,15 @@ class MciWatcher:
         # try fetch_quota again, get 401, and start a fresh OTP cycle.
         self._pending_quota_check = False
         self._last_otp_sent_at: "float | None" = None
+        # OTP attempt lifecycle (all monotonic seconds / counts):
+        #   _otp_deadline   — while now < this, the current OTP attempt is
+        #                     "active" → icon blinks. None when idle.
+        #   _otp_attempts   — consecutive timed-out attempts; indexes the
+        #                     backoff ladder. Reset on any auth success.
+        #   _backoff_until  — don't re-request an OTP before this instant.
+        self._otp_deadline: "float | None" = None
+        self._otp_attempts = 0
+        self._backoff_until: "float | None" = None
         self._force_run = False
         # Whether the next decisive outcome (success or final error) of
         # the current auth/fetch attempt should pop a user-facing
@@ -3214,13 +3264,26 @@ class MciWatcher:
         self._stop.set()
         self._wake.set()
 
+    def _otp_wait_active(self) -> bool:
+        """True while inside the active OTP-wait window of the current
+        attempt — i.e. we sent an OTP and are still within
+        ``otp_wait_s`` of it. The icon blinks only during this window,
+        NOT during the (potentially hours-long) backoff between attempts.
+        Uses a monotonic deadline so a never-arriving OTP can't blink
+        forever."""
+        return (
+            self._otp_deadline is not None
+            and time.monotonic() < self._otp_deadline
+        )
+
     def _refresh_busy(self):
         """Recompute the busy state and fire on_busy_change on edges.
-        Busy = a tick/on_otp body is executing, OR we're parked waiting
-        for an OTP SMS to come back (_pending_quota_check). Called at the
-        boundaries of tick() and on_otp_received() while holding
-        _client_lock."""
-        busy = self._busy_active or self._pending_quota_check
+        Busy = a tick/on_otp body is executing, OR we're inside the
+        active OTP-wait window (see _otp_wait_active). Called at the
+        boundaries of tick()/on_otp_received() and from the run loop
+        each wait slice (so the blink turns off when the window lapses).
+        Caller holds _client_lock."""
+        busy = self._busy_active or self._otp_wait_active()
         if busy == self._busy:
             return
         self._busy = busy
@@ -3232,8 +3295,19 @@ class MciWatcher:
 
     def trigger_now(self):
         """Tray-menu manual fire — re-run the tick now even if today's
-        already done or we're before the scheduled fetch time."""
-        self._force_run = True
+        already done or we're before the scheduled fetch time.
+
+        Resets the OTP retry cycle so a manual fetch always starts from
+        attempt #1: clears any active OTP-wait window, the backoff, and
+        the attempt counter. So if a manual fetch fails it re-enters the
+        same 60 s-wait → 5 m/30 m/60 m/6 h ladder from the top, exactly
+        like the first auto attempt of the day. Takes _client_lock so it
+        doesn't race a tick/on_otp_received in flight; the icon edge is
+        refreshed in case an active blink window was just cleared."""
+        with self._client_lock:
+            self._reset_otp_cycle()
+            self._refresh_busy()
+            self._force_run = True
         self._wake.set()
 
     def _next_wake_seconds(self) -> float:
@@ -3252,6 +3326,13 @@ class MciWatcher:
             now.date() + timedelta(days=1), dtime.min,
         )
         secs_to_midnight = (next_midnight - now).total_seconds() + 1.0
+        # An OTP auth cycle is in flight: wake promptly so the active
+        # window can time out, or so the backoff retry can fire. Both are
+        # capped by the slice in run(), but ask for the precise instant.
+        if self._otp_deadline is not None:
+            return max(1.0, self._otp_deadline - time.monotonic())
+        if self._backoff_until is not None:
+            return max(1.0, self._backoff_until - time.monotonic())
         # Cap reached for the day → idle until the new day begins.
         if self.client.get_extra("reached_date") == self._today_str():
             return max(1.0, secs_to_midnight)
@@ -3272,7 +3353,22 @@ class MciWatcher:
                 self.tick()
             except Exception as e:
                 self.logger.error(f"mci: tick error: {e}", exc_info=True)
-            self._wake.wait(self._next_wake_seconds())
+            # Sleep until the next scheduled wake, but never in one block
+            # longer than max_wait_slice_s — so a lapsed OTP-wait window
+            # is detected (blink dropped, backoff scheduled) within that
+            # bound even when a long backoff/midnight sleep is pending.
+            remaining = self._next_wake_seconds()
+            while remaining > 0 and not self._stop.is_set():
+                slice_s = min(remaining, self.max_wait_slice_s)
+                if self._wake.wait(slice_s):
+                    break  # woken early (trigger / stop / async otp result)
+                remaining -= slice_s
+                # Close a lapsed OTP-wait window promptly between ticks.
+                with self._client_lock:
+                    self._check_otp_timeout()
+                    if self._backoff_until is not None and \
+                            time.monotonic() >= self._backoff_until:
+                        break  # backoff elapsed → re-tick now to retry
 
     # ---- date tracking / housekeeping ----
 
@@ -3325,6 +3421,14 @@ class MciWatcher:
 
     def tick(self):
         with self._client_lock:
+            # Auto tick landing inside an OTP backoff window does no
+            # network work (see _tick_locked) — don't even raise the busy
+            # flag, or the icon would blink for the instant the skip
+            # takes. A forced (manual) tick clears the backoff and runs.
+            if not self._force_run and self._backoff_until is not None \
+                    and time.monotonic() < self._backoff_until:
+                self._tick_locked()
+                return
             self._busy_active = True
             self._refresh_busy()
             try:
@@ -3347,10 +3451,25 @@ class MciWatcher:
         if new_day:
             self._pending_day_begin = True
         if force:
-            # Manual trigger: bypass the cap-pause and always notify.
+            # Manual trigger: bypass the cap-pause, the OTP backoff, and
+            # always notify. Clear the backoff so _maybe_request_otp will
+            # send immediately.
             self._pending_notify = True
+            self._backoff_until = None
             self.logger.info("mci: force-triggered tick")
         else:
+            # Auto path: while inside an OTP backoff window, don't touch
+            # the panel at all — a fetch would just 403 again and the
+            # OTP re-send is gated anyway. Skipping avoids a wasted round
+            # trip and the brief busy-flicker it causes. The run loop
+            # wakes us when the backoff elapses.
+            if self._backoff_until is not None and \
+                    time.monotonic() < self._backoff_until:
+                left = int(self._backoff_until - time.monotonic())
+                self.logger.info(
+                    f"mci: in OTP backoff ({left} s left); skipping tick"
+                )
+                return
             # Auto path: if today's cap already fired, polling is
             # paused until the next day-begin — skip (a new day is
             # never "already reached", so day-begin still runs).
@@ -3380,31 +3499,95 @@ class MciWatcher:
             self.logger.error(f"mci: fetch_quota error: {e}")
             self._notify_error(f"Failed to fetch quota: {e}")
             return
+        self._reset_otp_cycle()
         self._on_quota_success(result)
 
+    def _reset_otp_cycle(self):
+        """Clear the OTP attempt/backoff state after a successful auth or
+        fetch. Caller must hold ``_client_lock``."""
+        self._otp_deadline = None
+        self._otp_attempts = 0
+        self._backoff_until = None
+        self._last_otp_sent_at = None
+        self._pending_quota_check = False
+
+    def _backoff_seconds_for(self, attempt: int) -> float:
+        """Backoff for the given (0-based) consecutive-timeout count.
+        Walks the ladder, then sticks on the last rung forever."""
+        idx = min(attempt, len(self.otp_backoff_s) - 1)
+        return self.otp_backoff_s[idx]
+
     def _maybe_request_otp(self):
-        """POST send-otp unless we're inside the cooldown window. Caller
-        must hold ``_client_lock``."""
+        """POST send-otp and open a fresh OTP-wait window, unless we're
+        still inside the active window of the previous attempt or inside
+        the post-timeout backoff wait. Caller must hold ``_client_lock``.
+
+        On success this sets ``_otp_deadline`` (drives the icon blink and
+        the timeout) and stamps the send time (the re-send cooldown)."""
         now = time.monotonic()
-        if self._last_otp_sent_at is not None:
-            elapsed = now - self._last_otp_sent_at
-            if elapsed < self.otp_wait_s:
-                left = int(self.otp_wait_s - elapsed)
-                self.logger.info(
-                    f"mci: OTP cooldown active ({left} s left); "
-                    "not re-sending"
-                )
-                return
+        # Still waiting on the current attempt's SMS — let it run.
+        if self._otp_deadline is not None and now < self._otp_deadline:
+            left = int(self._otp_deadline - now)
+            self.logger.info(
+                f"mci: OTP attempt still active ({left} s left); "
+                "not re-sending"
+            )
+            return
+        # In the backoff gap between attempts — the run loop will wake us
+        # when it elapses.
+        if self._backoff_until is not None and now < self._backoff_until:
+            left = int(self._backoff_until - now)
+            self.logger.info(
+                f"mci: OTP backoff active ({left} s left, "
+                f"attempt #{self._otp_attempts + 1} next); not re-sending"
+            )
+            return
         try:
             self.client.request_otp()
             self._last_otp_sent_at = now
+            self._otp_deadline = now + self.otp_wait_s
+            self._backoff_until = None
             self.logger.info(
-                "mci: send-otp dispatched; awaiting SMS receipt "
+                f"mci: send-otp dispatched (attempt "
+                f"#{self._otp_attempts + 1}); awaiting SMS for "
+                f"{self.otp_wait_s} s "
                 "(Fetcher will call on_otp_received when it lands)"
             )
         except Exception as e:
+            # Treat a failed send like a timed-out attempt so we still
+            # back off instead of hammering the endpoint every loop.
             self.logger.error(f"mci: request_otp failed: {e}")
+            self._otp_deadline = None
+            self._schedule_otp_backoff()
             self._notify_error(f"Failed to start auth: {e}")
+
+    def _schedule_otp_backoff(self):
+        """Advance the backoff ladder after a failed/timed-out attempt.
+        Caller must hold ``_client_lock``."""
+        wait_s = self._backoff_seconds_for(self._otp_attempts)
+        self._otp_attempts += 1
+        self._backoff_until = time.monotonic() + wait_s
+        self.logger.warning(
+            f"mci: OTP attempt #{self._otp_attempts} timed out; "
+            f"backing off {int(wait_s)} s before retry "
+            f"(attempt #{self._otp_attempts + 1})"
+        )
+
+    def _check_otp_timeout(self):
+        """Called from the run loop each wait slice (holds the client
+        lock). If an OTP-wait window has lapsed without on_otp_received,
+        close it, drop the blink, and schedule the next backoff retry.
+        One-time-per-day notification on the first timeout of the day."""
+        if self._otp_deadline is None:
+            return
+        if time.monotonic() < self._otp_deadline:
+            return
+        self._otp_deadline = None
+        self._refresh_busy()  # window closed → icon stops blinking
+        # Notify once/day that auth is stalling (gated like other MCI
+        # popups via _pending_notify, set by tick()).
+        self._notify_error("MCI auth: OTP SMS did not arrive in time")
+        self._schedule_otp_backoff()
 
     # ---- OTP callback from the Fetcher ----
 
@@ -3451,17 +3634,18 @@ class MciWatcher:
                     self._pending_quota_check = False
                     self._notify_error(f"Verify failed: {e}")
                 return
-            # Successful verify ends the auth cycle, so any subsequent
-            # 401 should be allowed to request OTP again without waiting
-            # for the previous cooldown to elapse.
-            self._last_otp_sent_at = None
-            if not self._pending_quota_check:
+            # Successful verify ends the auth cycle: close the OTP-wait
+            # window (stops the blink), reset the backoff ladder, and
+            # allow a subsequent 401 to request a fresh OTP immediately.
+            was_pending = self._pending_quota_check
+            self._reset_otp_cycle()
+            self._refresh_busy()
+            if not was_pending:
                 self.logger.info(
                     "mci: session refreshed opportunistically "
                     "(no quota check was pending)"
                 )
                 return
-            self._pending_quota_check = False
             try:
                 result = self.client.fetch_quota()
             except Exception as e:
@@ -4002,11 +4186,45 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
         txt.tag_add("sel", "1.0", "end-1c")
         return "break"
 
+    def _copy(_event=None):
+        # On a "disabled" Text the built-in <<Copy>> binding is a no-op,
+        # so Ctrl+C / Ctrl+Insert never reach the clipboard. Read the
+        # current selection ourselves and push it, falling back to the
+        # whole body if nothing is selected.
+        try:
+            sel = txt.get("sel.first", "sel.last")
+        except tk.TclError:
+            sel = ""
+        if not sel:
+            sel = txt.get("1.0", "end-1c")
+        win.clipboard_clear()
+        win.clipboard_append(sel)
+        return "break"
+
     txt.bind("<Control-a>", _select_all)
     txt.bind("<Control-A>", _select_all)
+    txt.bind("<Control-c>", _copy)
+    txt.bind("<Control-C>", _copy)
+    txt.bind("<Control-Insert>", _copy)
 
-    btn = tk.Button(win, text="Close", width=12, command=_close)
-    btn.pack(pady=(2, 10))
+    # --- RTL toggle: flips justification of the whole SMS body ---
+    rtl = {"v": False}
+
+    def _toggle_rtl():
+        rtl["v"] = not rtl["v"]
+        txt.config(state="normal")
+        txt.tag_configure(
+            "body", justify=("right" if rtl["v"] else "left"))
+        txt.tag_add("body", "1.0", "end-1c")
+        txt.config(state="disabled")
+        rtl_btn.config(text=("RTL ✓" if rtl["v"] else "RTL"))
+
+    btnbar = tk.Frame(win)
+    btnbar.pack(pady=(2, 10))
+    rtl_btn = tk.Button(btnbar, text="RTL", width=6, command=_toggle_rtl)
+    rtl_btn.pack(side="left", padx=(0, 8))
+    btn = tk.Button(btnbar, text="Close", width=12, command=_close)
+    btn.pack(side="left")
     win.bind("<Escape>", lambda _e: _close())
     win.protocol("WM_DELETE_WINDOW", _close)
     win.lift()
@@ -4463,9 +4681,31 @@ def main() -> int:
     ))
     menu_items.append(pystray.MenuItem("Exit", on_exit))
 
+    # Seed the "Disabled" toggle + gray-icon state from the modem's live
+    # Mobile Network → Enabled checkbox, BEFORE building the icon, so the
+    # first rendered frame and menu checkmark already reflect reality
+    # (4G off => checked + gray). Runs ahead of the first MCI fetch (which
+    # is behind a 20 s startup grace). A probe failure is non-fatal: leave
+    # the defaults (enabled / not gray) and let the toggle work as before.
+    try:
+        net_enabled = fetcher.modem.get_mobile_network_enabled()
+        with net_toggle_lock:
+            net_toggle["checked"] = not net_enabled
+        with icon_state_lock:
+            icon_state["disabled"] = not net_enabled
+        logger.info(
+            f"net-toggle: initial Mobile Network Enabled={net_enabled} "
+            f"(Disabled toggle {'checked' if not net_enabled else 'unchecked'})"
+        )
+    except Exception as e:
+        logger.warning(
+            f"net-toggle: could not read initial Enabled state "
+            f"({e}); assuming enabled (not disabled)"
+        )
+
     icon = pystray.Icon(
         APP_NAME,
-        make_icon_image(),
+        make_icon_image(disabled=icon_state["disabled"]),
         APP_NAME,
         menu=pystray.Menu(*menu_items),
     )
