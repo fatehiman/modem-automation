@@ -3577,16 +3577,26 @@ class MciWatcher:
         """Called from the run loop each wait slice (holds the client
         lock). If an OTP-wait window has lapsed without on_otp_received,
         close it, drop the blink, and schedule the next backoff retry.
-        One-time-per-day notification on the first timeout of the day."""
+
+        Does NOT notify on this timeout: the OTP SMS routinely arrives a
+        bit after the 60 s window (carrier latency), and _pending_quota_check
+        stays set across the backoff so a late code still drives the
+        deferred fetch (see _on_otp_received_locked). Firing a "no code
+        received" popup here produced a false-negative immediately
+        followed by the real code's SMS toast + quota success. We only
+        notify on a hard give-up (whole ladder exhausted) or a genuine
+        request/verify error — and critically we keep ``_pending_notify``
+        intact so that eventual success/failure can still notify."""
         if self._otp_deadline is None:
             return
         if time.monotonic() < self._otp_deadline:
             return
         self._otp_deadline = None
         self._refresh_busy()  # window closed → icon stops blinking
-        # Notify once/day that auth is stalling (gated like other MCI
-        # popups via _pending_notify, set by tick()).
-        self._notify_error("MCI auth: OTP SMS did not arrive in time")
+        self.logger.info(
+            "mci: OTP-wait window lapsed; a late code can still complete "
+            "the pending fetch — backing off, not notifying"
+        )
         self._schedule_otp_backoff()
 
     # ---- OTP callback from the Fetcher ----
@@ -3855,6 +3865,23 @@ def make_icon_image(unread: int = 0, relaying: bool = False,
     return img
 
 
+# ---------- window helpers ----------
+
+def _center_window(win: tk.Toplevel, w: int, h: int):
+    """Place a Toplevel at the centre of the screen at size w×h.
+    Geometry is computed from the screen the window is on; falls back to
+    the primary screen metrics if those are unavailable."""
+    try:
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+    except Exception:
+        win.geometry(f"{w}x{h}")
+
+
 # ---------- log viewer ----------
 
 def show_log_window(parent: tk.Tk, log_dir: Path):
@@ -3870,7 +3897,7 @@ def show_log_window(parent: tk.Tk, log_dir: Path):
 
     win = tk.Toplevel(parent)
     win.title(f"smsFetcher — {datetime.now().strftime('%Y-%m-%d')} log")
-    win.geometry("900x520")
+    _center_window(win, 900, 520)
     txt = scrolledtext.ScrolledText(
         win, wrap="none", font=("Consolas", 10),
     )
@@ -4149,7 +4176,7 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
 
     win = tk.Toplevel(parent)
     win.title(f"SMS — {sender}")
-    win.geometry("720x440")
+    _center_window(win, 720, 440)
 
     closed = {"v": False}
 
@@ -4175,8 +4202,16 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
              anchor="w", font=("Segoe UI", 10)).pack(fill="x")
     tk.Frame(win, height=1, bg="#cccccc").pack(fill="x", padx=10, pady=4)
 
+    # Pack the button bar at the BOTTOM first so it always keeps its
+    # space — previously the text area (expand=True) was packed before
+    # the buttons and could push them off the bottom of a short window,
+    # forcing a manual resize to reach Close. With side="bottom" reserved
+    # up front, the text area fills only the remaining height.
+    btnbar = tk.Frame(win)
+    btnbar.pack(side="bottom", fill="x", pady=(2, 10))
+
     txt = scrolledtext.ScrolledText(win, wrap="word", font=("Tahoma", 11))
-    txt.pack(fill="both", expand=True, padx=10, pady=4)
+    txt.pack(side="top", fill="both", expand=True, padx=10, pady=4)
     txt.insert("1.0", body)
     txt.config(state="disabled")
 
@@ -4207,11 +4242,13 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
     txt.bind("<Control-C>", _copy)
     txt.bind("<Control-Insert>", _copy)
 
-    # --- RTL toggle: flips justification of the whole SMS body ---
-    rtl = {"v": False}
+    # --- RTL toggle: flips justification of the whole SMS body.
+    # Defaults ON since these SMSes are predominantly Persian. (Tk has no
+    # bidi engine, so this only right-aligns the paragraph; it does not
+    # reorder characters.) ---
+    rtl = {"v": True}
 
-    def _toggle_rtl():
-        rtl["v"] = not rtl["v"]
+    def _apply_rtl():
         txt.config(state="normal")
         txt.tag_configure(
             "body", justify=("right" if rtl["v"] else "left"))
@@ -4219,12 +4256,18 @@ def show_sms_window(parent: tk.Tk, data: dict, on_close=None):
         txt.config(state="disabled")
         rtl_btn.config(text=("RTL ✓" if rtl["v"] else "RTL"))
 
-    btnbar = tk.Frame(win)
-    btnbar.pack(pady=(2, 10))
-    rtl_btn = tk.Button(btnbar, text="RTL", width=6, command=_toggle_rtl)
+    def _toggle_rtl():
+        rtl["v"] = not rtl["v"]
+        _apply_rtl()
+
+    # Centre the button group within the bottom bar.
+    btngroup = tk.Frame(btnbar)
+    btngroup.pack()
+    rtl_btn = tk.Button(btngroup, text="RTL", width=6, command=_toggle_rtl)
     rtl_btn.pack(side="left", padx=(0, 8))
-    btn = tk.Button(btnbar, text="Close", width=12, command=_close)
+    btn = tk.Button(btngroup, text="Close", width=12, command=_close)
     btn.pack(side="left")
+    _apply_rtl()   # default RTL on
     win.bind("<Escape>", lambda _e: _close())
     win.protocol("WM_DELETE_WINDOW", _close)
     win.lift()
