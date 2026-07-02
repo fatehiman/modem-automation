@@ -118,6 +118,11 @@ DEFAULT_CONFIG = {
     "mci_quota_reached_bat": "mci-quota-reached.bat",
     "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
     "mci_otp_pattern": r"Code:\s*(\d+)",
+    # Whether MCI OTP SMSes are shown as a toast. Off by default: the
+    # code is dispatched to the MciWatcher silently (saved to sms_del/)
+    # so routine daily logins don't pop a popup. Set true when you need
+    # to see the OTP arrive for monitoring.
+    "display_mci_otp": False,
     # How long one OTP attempt stays "active" (icon blinks) waiting for
     # the SMS to land. Kept short so a never-arriving OTP doesn't blink
     # forever — on expiry the watcher backs off and retries. Also the
@@ -1079,12 +1084,17 @@ class Fetcher:
             sender = rec["sender"]
             blocked = bool(self.blacklist and self.blacklist.contains(sender))
             is_otp = self._is_mci_otp(rec)
-            # OTP SMSes are saved to sms/ and notified like any other
-            # received SMS (even when auto-triggered) so the user always
-            # sees the code arrive. The MciWatcher additionally receives
-            # the digits via the _maybe_dispatch_otp callback below.
-            # Blocked senders still go straight to sms_del/.
-            target_dir = self.del_dir if blocked else self.sms_dir
+            # OTP SMSes are dispatched to the MciWatcher via the
+            # _maybe_dispatch_otp callback below regardless of routing.
+            # Whether the user also sees a toast is gated by
+            # `display_mci_otp` (default false): off → saved straight to
+            # sms_del/ so routine daily logins stay silent; on → saved to
+            # sms/ and notified like any received SMS (for monitoring).
+            # Blocked senders always go straight to sms_del/.
+            otp_silent = is_otp and not self.cfg.get("display_mci_otp", False)
+            target_dir = (
+                self.del_dir if (blocked or otp_silent) else self.sms_dir
+            )
             try:
                 path = save_sms(rec, target_dir, self.cfg["modem_url"])
             except Exception as e:
@@ -1093,15 +1103,20 @@ class Fetcher:
                 )
                 continue
             if is_otp:
-                # Saved to sms/ (unless the sender is blacklisted) so the
-                # Notifier shows it like any received SMS. Always dispatch
-                # the digits to the MciWatcher. Not forwarded onward.
+                # Always dispatch the digits to the MciWatcher. Routing
+                # (sms/ = notified, sms_del/ = silent) is decided above by
+                # `display_mci_otp` and the blacklist. Not forwarded onward.
+                if blocked:
+                    routing = "blocked, silent"
+                elif otp_silent:
+                    routing = "silent (display_mci_otp off)"
+                else:
+                    routing = "notified"
                 self.logger.info(
                     f"OTP-MCI index={idx} sender={sender} "
                     f"received_at='{rec['received_at']}' -> "
                     f"{target_dir.name}/{path.name} "
-                    f"({'blocked, silent' if blocked else 'notified'}; "
-                    f"code dispatched)"
+                    f"({routing}; code dispatched)"
                 )
                 self._maybe_dispatch_otp(rec)
             elif blocked:

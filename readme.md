@@ -243,6 +243,7 @@ gives full control over click behavior and styling.
   "mci_quota_reached_bat": "mci-quota-reached.bat",
   "mci_otp_match_substring": "کد یکبار مصرف همراه‌من",
   "mci_otp_pattern": "Code:\\s*(\\d+)",
+  "display_mci_otp": false,
   "mci_otp_wait_seconds": 120,
   "mci_quota_log_filename": "remained_quota.txt"
 }
@@ -637,7 +638,8 @@ triggers a check while the session is dead), the flow is:
    as the user keeps clicking *Check MCI quota*.
 3. Some seconds later, the OTP SMS arrives at the modem. The Fetcher
    pulls it on its next inbox poll (or sooner — see below), saves it
-   to `sms_del/` (silent — no toast), and calls
+   to `sms_del/` (silent — no toast, unless `display_mci_otp` is
+   `true`, in which case it's saved to `sms/` and shown), and calls
    `mci_watcher.on_otp_received(code)` with the parsed digits.
 4. `on_otp_received` POSTs `verify` with the code. On 2xx, the JWT
    is captured from the response body and saved. Then — because
@@ -740,8 +742,9 @@ app no longer triggers it automatically. Set `mci_enabled` to
 | `mci_quota_reached_bat` | `"mci-quota-reached.bat"` | Batch file launched once when today's usage hits the cap. Relative paths resolve against the app dir; empty/missing → logged and skipped. |
 | `mci_state_file` | `"mci_state.json"` | Where cookies + JWT + `day_begin_date` + `day_begin_quota_gb` + `reached_date` + `notify_date` are persisted between runs. Delete the file to force a fresh OTP login + reset of today's baseline/cap/notify state on next tick. |
 | `mci_quota_below_gb` | `5.0` | Threshold in GB for the **low-remaining** warning popup (separate from the daily-usage cap). Pop the warning only when the scraped *remaining* value is strictly less than this. |
-| `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. (a) the Fetcher routes matching SMSes straight to `sms_del/` so the OTP doesn't pop a toast; (b) right after saving, it extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. |
+| `mci_otp_match_substring` | `"کد یکبار مصرف همراه‌من"` | Body substring used to recognise an MCI OTP SMS. Right after saving, the Fetcher extracts the digits with `mci_otp_pattern` and calls `MciWatcher.on_otp_received(code)`. Routing to a toast vs. silent is controlled by `display_mci_otp`. |
 | `mci_otp_pattern` | `"Code:\\s*(\\d+)"` | Regex extracting the OTP digits from the SMS body. First capture group is the code. |
+| `display_mci_otp` | `false` | Whether an MCI OTP SMS is shown as a toast. **Off by default** — the code is still dispatched to the watcher, but the SMS is saved straight to `sms_del/` so routine daily logins stay silent. Set `true` to route the OTP to `sms/` and show it like any received SMS (useful for monitoring). The digit dispatch to `MciWatcher.on_otp_received` happens the same way either way; blacklisted senders are always silent regardless. |
 | `mci_otp_wait_seconds` | `120` | Cooldown after a `send-otp` — the watcher won't re-send for this long, even if a fresh tick triggers a new auth need. Prevents burning OTPs when an SMS gets stuck. Reset to zero on a successful verify. |
 | `mci_quota_log_filename` | `"remained_quota.txt"` | Filename inside `usage_total/` for the history log. |
 
